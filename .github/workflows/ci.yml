@@ -85,6 +85,86 @@ jobs:
           curl -sf http://127.0.0.1:8123/healthz | grep -q '"status":"ok"'
           kill %1
 
+  worker:
+    # The Cloudflare deployment. Everything here runs without Cloudflare
+    # credentials: local D1, local workerd, and a deploy dry run.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Generate binding types
+        run: npx wrangler types
+
+      - name: Static types
+        run: npx tsc --noEmit
+
+      - name: Unit tests (domain parity, provider, Telegram)
+        run: npx vitest run
+
+      - name: D1 migrations initialise a clean local database
+        run: |
+          rm -rf .wrangler/state
+          npx wrangler d1 migrations apply flightnotify --local
+          npx wrangler d1 execute flightnotify --local \
+            --command "SELECT value FROM schema_meta WHERE key='schema_version';" \
+            | grep -q '"value": "1"'
+
+      - name: Integration tests (D1, Cron, lease recovery, auth)
+        run: npx vitest run --config vitest.workers.config.ts
+
+      - name: Production build and deploy dry run
+        # Requires no authentication, so a broken bundle fails here rather
+        # than during a real cutover.
+        run: npx wrangler deploy --dry-run --outdir=dist
+
+      - name: No placeholder or real credentials in the bundle
+        run: |
+          # The database id stays a placeholder in the committed config, and no
+          # secret may be inlined into the deployed script.
+          grep -q 'PLACEHOLDER_D1_DATABASE_ID' wrangler.jsonc
+          if grep -rniE 'serpapi_api_key["'"'"']?\s*[:=]\s*["'"'"'][a-f0-9]{32}' dist/; then
+            echo "::error::a SerpApi-shaped key is present in the built bundle"
+            exit 1
+          fi
+          if grep -rnE '[0-9]{8,10}:[A-Za-z0-9_-]{35}' dist/; then
+            echo "::error::a Telegram-bot-token-shaped string is present in the built bundle"
+            exit 1
+          fi
+
+  golden-vectors:
+    # The Worker is a port, not a rewrite. These vectors are generated from the
+    # Python implementation and asserted by the Worker suite, so a drift in
+    # either one is a build failure rather than a silent behaviour change.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Regenerate and diff
+        run: |
+          python -m tests.golden.generate_vectors > /tmp/vectors.json
+          if ! diff -u worker/test/golden/vectors.json /tmp/vectors.json; then
+            echo "::error::golden vectors are stale; run `make golden` and commit the result"
+            exit 1
+          fi
+
   docker:
     runs-on: ubuntu-latest
     steps:

@@ -13,6 +13,13 @@ allows 250 searches/month, so the scheduler is built around not burning them. Th
 with no credentials at all and truthfully reports a "setup required" state rather than showing
 sample fares.
 
+> **Running on Cloudflare.** FlightNotify also deploys as a Cloudflare Worker with D1 and a
+> Cron Trigger, entirely within the Workers Free plan — no always-on server and no SSH
+> session. It adds single-user password authentication, which the loopback-bound Python app
+> did not need. See **[docs/CLOUDFLARE.md](docs/CLOUDFLARE.md)** for setup, data migration,
+> cutover and rollback. The Python app in this repository remains the rollback target and the
+> behavioural reference the Worker is tested against.
+
 ---
 
 ## Contents

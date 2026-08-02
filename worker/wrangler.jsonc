@@ -1,0 +1,64 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "flightnotify",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+
+  // Static assets (CSS/JS) ship with the Worker itself. Requests to them are
+  // free and unmetered, so the UI costs no Worker invocations.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "flightnotify",
+      // Placeholder: `npm run d1:create` (wrangler d1 create) prints the real
+      // id and rewrites this field. Never commit a real database id.
+      "database_id": "PLACEHOLDER_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Off the quarter-hour on purpose: :00/:15/:30/:45 is where every cron on the
+  // platform lands. Due status is derived from trackers.next_run_at, not from
+  // this interval, so the interval only bounds scheduling latency.
+  "triggers": {
+    "crons": ["7,22,37,52 * * * *"]
+  },
+
+  "observability": {
+    "enabled": true
+  },
+
+  "vars": {
+    "APP_TIMEZONE": "America/Los_Angeles",
+    "DEFAULT_CURRENCY": "USD",
+    "DEFAULT_MARKET": "us",
+
+    // Verified against this SerpApi account on 2026-08-02 with real one-adult
+    // and two-adult searches. Do not re-run that experiment.
+    "SERPAPI_PRICE_SCOPE": "party_total",
+
+    "MONTHLY_SEARCH_BUDGET": "250",
+    // 4% of 250 = 10 searches, matching the previous absolute
+    // SERPAPI_RESERVE_SEARCHES=10. Held back so a manual "Check now" still
+    // works after automation has stopped.
+    "SEARCH_BUDGET_RESERVE_PERCENT": "4",
+    "HOURLY_SEARCH_LIMIT": "50",
+    "QUERY_CACHE_TTL_SECONDS": "900",
+
+    // Cutover step 1 deploys with this false: the Cron Trigger is registered
+    // but the handler performs no live work. Flip to "true" only after the old
+    // Python scheduler is disabled.
+    "SCHEDULER_ENABLED": "false",
+
+    // Bounds work per invocation against the Free plan's 10ms CPU / 50
+    // subrequest / 50 D1 query ceilings.
+    "MAX_TRACKERS_PER_TICK": "2",
+    "MAX_QUERIES_PER_TICK": "3",
+    "SCHEDULER_LEASE_TTL_SECONDS": "300"
+  }
+}
