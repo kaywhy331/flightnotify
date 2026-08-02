@@ -158,7 +158,11 @@ def run_cli(
         capture_output=True,
         text=True,
         env=env,
-        cwd=PROJECT_ROOT,
+        # Run from an empty directory, never the checkout: pydantic-settings
+        # loads `.env` relative to the working directory, so a developer who
+        # has actually configured FlightNotify would otherwise leak real
+        # credentials into tests that deliberately unset them.
+        cwd=tmp_path,
         timeout=180,
     )
 
