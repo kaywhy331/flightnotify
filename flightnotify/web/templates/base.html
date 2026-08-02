@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{{ title }} · FlightNotify</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>%E2%9C%88</text></svg>">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<header class="site-header">
+  <div class="inner">
+    <a class="brand" href="/"><span class="glyph" aria-hidden="true">✈</span> FlightNotify</a>
+    <nav class="site-nav" aria-label="Primary">
+      <a href="/" {% if nav == 'dashboard' %}aria-current="page"{% endif %}>Dashboard</a>
+      <a href="/trackers" {% if nav == 'trackers' %}aria-current="page"{% endif %}>Trackers</a>
+      <a href="/settings" {% if nav == 'settings' %}aria-current="page"{% endif %}>Settings</a>
+    </nav>
+    <a class="btn btn-primary btn-small" href="/trackers/new">New tracker</a>
+  </div>
+</header>
+
+<main id="main">
+  {% if startup_error %}
+  <div class="notice notice-danger" role="alert">
+    <strong>FlightNotify could not prepare the database.</strong>
+    {{ startup_error }}
+  </div>
+  {% endif %}
+
+  {% if flashes %}
+  <div role="status" aria-live="polite">
+    {% for item in flashes %}
+    <div class="notice notice-{{ item.level }}">{{ item.message }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="site-footer">
+  <p>
+    FlightNotify records prices it has observed through SerpApi. It does not predict future
+    minimums and does not guarantee that an advertised fare is still bookable.
+    Times shown in {{ app_timezone }}.
+  </p>
+</footer>
+
+<script src="/static/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>Trackers</h1>
+    <p class="sub">
+      {{ rows|length }} tracker{{ '' if rows|length == 1 else 's' }} ·
+      {{ quota.remaining_safe }} of {{ quota.monthly_limit }} provider searches available to
+      automation this period.
+    </p>
+  </div>
+  <div class="head-actions">
+    <a class="btn btn-primary" href="/trackers/new">New tracker</a>
+  </div>
+</div>
+
+{% if not rows %}
+<section class="card empty-state">
+  <h2>No trackers yet</h2>
+  <p>A tracker defines one round trip: a route, a passenger group, exact or flexible dates,
+     a comparison currency, country markets and a price threshold.</p>
+  <a class="btn btn-primary" href="/trackers/new">Create your first tracker</a>
+</section>
+{% else %}
+
+<section class="card">
+  <div class="table-wrap">
+    <table class="stacked">
+      <caption class="visually-hidden">All trackers with observed prices and schedule</caption>
+      <thead>
+        <tr>
+          <th scope="col">Tracker</th>
+          <th scope="col">Dates</th>
+          <th scope="col">Latest</th>
+          <th scope="col">Observed low</th>
+          <th scope="col">Threshold</th>
+          <th scope="col">Status</th>
+          <th scope="col">Last success</th>
+          <th scope="col">Next check</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        {% set t = row.tracker %}
+        <tr>
+          <td data-label="Tracker">
+            <a href="/trackers/{{ t.id }}"><strong>{{ t.name }}</strong></a>
+            <span class="small muted" style="display:block">
+              {{ t.route }} · {{ t.passenger_summary }} · {{ cabin_labels.get(t.cabin, t.cabin) }}
+            </span>
+            <span class="small muted" style="display:block">
+              Markets: {% for m in row.markets %}<span class="pill">{{ m|upper }}</span> {% endfor %}
+              · {{ t.currency }}
+            </span>
+          </td>
+          <td data-label="Dates">
+            {{ date_mode_labels.get(t.date_mode, t.date_mode) }}
+            <span class="small muted" style="display:block">{{ row.date_summary }}</span>
+            {% if row.coverage_label %}
+            <span class="small muted" style="display:block">{{ row.coverage_label }}</span>
+            {% endif %}
+          </td>
+          <td data-label="Latest" class="num">
+            {{ row.latest_price | money(t.currency) }}
+            {% if row.under_threshold %}<span class="badge badge-ok">At/below</span>{% endif %}
+          </td>
+          <td data-label="Observed low" class="num">{{ row.low_price | money(t.currency) }}</td>
+          <td data-label="Threshold" class="num">
+            {{ row.threshold | money(t.currency) }}
+            <span class="small muted" style="display:block">
+              {{ 'per traveler' if t.threshold_basis == 'per_traveler' else 'whole party' }}
+            </span>
+          </td>
+          <td data-label="Status">
+            <span class="badge badge-{{ row.status_tone }}">{{ row.status_label }}</span>
+          </td>
+          <td data-label="Last success" class="num">{{ row.last_success_at | relative }}</td>
+          <td data-label="Next check" class="num">
+            {% if t.status == 'active' %}{{ row.next_run_at | relative }}{% else %}—{% endif %}
+          </td>
+          <td data-label="">
+            <div class="btn-row">
+              <a class="btn btn-small" href="/trackers/{{ t.id }}">Details</a>
+              <form method="post" action="/trackers/{{ t.id }}/check" class="inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="btn btn-small" type="submit">Check now</button>
+              </form>
+              {% if t.status == 'active' %}
+              <form method="post" action="/trackers/{{ t.id }}/pause" class="inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="btn btn-small" type="submit">Pause</button>
+              </form>
+              {% else %}
+              <form method="post" action="/trackers/{{ t.id }}/resume" class="inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="btn btn-small" type="submit">Resume</button>
+              </form>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+{% endblock %}

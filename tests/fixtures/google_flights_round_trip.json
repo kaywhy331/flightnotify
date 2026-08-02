@@ -1,0 +1,153 @@
+{
+  "search_metadata": {
+    "id": "66ab1f2c3d4e5f6a7b8c9d00",
+    "status": "Success",
+    "json_endpoint": "https://serpapi.com/searches/66ab1f2c3d4e5f6a7b8c9d00.json",
+    "created_at": "2026-08-01 09:15:02 UTC",
+    "processed_at": "2026-08-01 09:15:05 UTC",
+    "google_flights_url": "https://www.google.com/travel/flights?hl=en&gl=us&curr=USD&tfs=EXAMPLETOKEN",
+    "total_time_taken": 2.71
+  },
+  "search_parameters": {
+    "engine": "google_flights",
+    "hl": "en",
+    "gl": "us",
+    "departure_id": "SFO",
+    "arrival_id": "NRT",
+    "outbound_date": "2026-10-12",
+    "return_date": "2026-10-20",
+    "currency": "USD",
+    "adults": 2,
+    "travel_class": 1,
+    "type": 1
+  },
+  "best_flights": [
+    {
+      "flights": [
+        {
+          "departure_airport": {
+            "name": "San Francisco International Airport",
+            "id": "SFO",
+            "time": "2026-10-12 11:05"
+          },
+          "arrival_airport": {
+            "name": "Tokyo Narita International Airport",
+            "id": "NRT",
+            "time": "2026-10-13 14:40"
+          },
+          "duration": 655,
+          "airplane": "Boeing 787",
+          "airline": "ANA",
+          "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/NH.png",
+          "travel_class": "Economy",
+          "flight_number": "NH 8",
+          "legroom": "34 in",
+          "extensions": ["Average legroom (34 in)", "Wi-Fi for a fee"],
+          "overnight": true
+        }
+      ],
+      "layovers": [],
+      "total_duration": 655,
+      "carbon_emissions": {
+        "this_flight": 786000,
+        "typical_for_this_route": 810000,
+        "difference_percent": -3
+      },
+      "price": 1248,
+      "type": "Round trip",
+      "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/NH.png",
+      "extensions": ["Checked bag for a fee"],
+      "departure_token": "WyJDalJJZEV4VVJFRXhTRVZuUVU5SFNITkJRa0ZDUnkwdExTMHRMUzB0"
+    }
+  ],
+  "other_flights": [
+    {
+      "flights": [
+        {
+          "departure_airport": {
+            "name": "San Francisco International Airport",
+            "id": "SFO",
+            "time": "2026-10-12 08:30"
+          },
+          "arrival_airport": {
+            "name": "Seattle-Tacoma International Airport",
+            "id": "SEA",
+            "time": "2026-10-12 10:45"
+          },
+          "duration": 135,
+          "airplane": "Boeing 737MAX 9",
+          "airline": "Alaska",
+          "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/AS.png",
+          "travel_class": "Economy",
+          "flight_number": "AS 1234",
+          "legroom": "31 in",
+          "extensions": ["Average legroom (31 in)"]
+        },
+        {
+          "departure_airport": {
+            "name": "Seattle-Tacoma International Airport",
+            "id": "SEA",
+            "time": "2026-10-12 13:05"
+          },
+          "arrival_airport": {
+            "name": "Tokyo Narita International Airport",
+            "id": "NRT",
+            "time": "2026-10-13 15:55"
+          },
+          "duration": 590,
+          "airplane": "Boeing 787",
+          "airline": "Japan Airlines",
+          "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/JL.png",
+          "travel_class": "Economy",
+          "flight_number": "JL 69",
+          "legroom": "33 in",
+          "extensions": ["In-seat power outlet"],
+          "overnight": true
+        }
+      ],
+      "layovers": [
+        {
+          "duration": 140,
+          "name": "Seattle-Tacoma International Airport",
+          "id": "SEA"
+        }
+      ],
+      "total_duration": 865,
+      "carbon_emissions": {
+        "this_flight": 912000,
+        "typical_for_this_route": 810000,
+        "difference_percent": 13
+      },
+      "price": 1390,
+      "type": "Round trip",
+      "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/multi.png",
+      "extensions": ["Checked bag for a fee"],
+      "departure_token": "WyJDalJJZEV4VVJFRXhTRVZuUVU5SFNITkJRa0ZDUnkwdExTMHRMUzB1"
+    }
+  ],
+  "price_insights": {
+    "lowest_price": 1248,
+    "price_level": "typical",
+    "typical_price_range": [1180, 1520]
+  },
+  "airports": [
+    {
+      "departure": [
+        {
+          "airport": { "id": "SFO", "name": "San Francisco International Airport" },
+          "city": "San Francisco",
+          "country": "United States",
+          "country_code": "US"
+        }
+      ],
+      "arrival": [
+        {
+          "airport": { "id": "NRT", "name": "Tokyo Narita International Airport" },
+          "city": "Tokyo",
+          "country": "Japan",
+          "country_code": "JP"
+        }
+      ]
+    }
+  ]
+}

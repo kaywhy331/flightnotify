@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card" role="alert">
+  <h1>{{ title }}</h1>
+  <p class="badge badge-danger">HTTP {{ status_code }}</p>
+  <p>{{ detail }}</p>
+  <p class="small muted">
+    Your stored trackers, price observations and alert history are unaffected by this error.
+  </p>
+  <div class="btn-row">
+    <a class="btn btn-primary" href="/">Back to the dashboard</a>
+    <a class="btn" href="/trackers">Trackers</a>
+  </div>
+</section>
+{% endblock %}

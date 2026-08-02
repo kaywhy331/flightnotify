@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      # CI never carries real credentials, so no live call and no provider
+      # quota can be consumed. The live suite is opt-in and stays skipped.
+      APP_TIMEZONE: UTC
+      APP_SECRET_KEY: ci-only-not-a-real-secret
+      DATABASE_URL: sqlite:///data/ci.db
+      LOG_LEVEL: WARNING
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format check
+        run: ruff format --check .
+
+      - name: Static types
+        run: mypy
+
+      - name: Migrations apply to a clean database
+        run: |
+          rm -f data/ci.db
+          flightnotify migrate
+          python -m alembic downgrade base
+          python -m alembic upgrade head
+
+      - name: No model/migration drift
+        run: python -m alembic check
+
+      - name: Tests
+        run: pytest --cov=flightnotify --cov-report=term-missing
+
+      - name: Live tests stay skipped without opt-in
+        run: pytest tests/live -q -rs | tee /dev/stderr | grep -q "skipped"
+
+      - name: Application starts in the setup-required state
+        run: |
+          # No SERPAPI_API_KEY / TELEGRAM_BOT_TOKEN in this environment.
+          flightnotify serve --port 8123 &
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8123/healthz && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8123/ | grep -q "SERPAPI_API_KEY is not set"
+          curl -sf http://127.0.0.1:8123/healthz | grep -q '"status":"ok"'
+          kill %1
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t flightnotify:ci .
+      - name: Container starts and reports health without credentials
+        run: |
+          docker run -d --name fn -p 127.0.0.1:8124:8000 \
+            -e APP_SECRET_KEY=ci-only-not-a-real-secret \
+            -e APP_TIMEZONE=UTC \
+            flightnotify:ci
+          for _ in $(seq 1 40); do
+            curl -sf http://127.0.0.1:8124/healthz && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8124/healthz | grep -q '"status":"ok"'
+          curl -sf http://127.0.0.1:8124/ | grep -q "Setup checklist"
+          docker rm -f fn

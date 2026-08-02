@@ -1,0 +1,217 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>Dashboard</h1>
+    <p class="sub">Observed fares, scheduled checks and provider allowance.</p>
+  </div>
+  <div class="head-actions">
+    <a class="btn btn-primary" href="/trackers/new">New tracker</a>
+  </div>
+</div>
+
+{% if not setup.complete %}
+<section class="card" aria-labelledby="setup-heading">
+  <h2 id="setup-heading">Setup checklist</h2>
+  <p class="small muted">
+    FlightNotify never shows sample or generated fares. Until a SerpApi key is configured,
+    no prices can be recorded.
+  </p>
+  <ul class="setup-list">
+    {% for item in setup['items'] %}
+    <li class="{{ 'done' if item.done else 'todo' }}">
+      <span class="mark" aria-hidden="true">{{ '✓' if item.done else '○' }}</span>
+      <span>
+        <strong>{{ item.label }}</strong>
+        <span class="visually-hidden">— {{ 'done' if item.done else 'not done yet' }}</span>
+        <span class="small muted" style="display:block">{{ item.detail }}</span>
+        {% if item.action_href %}
+        <a class="small" href="{{ item.action_href }}">{{ item.action_label }}</a>
+        {% endif %}
+      </span>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<section class="grid grid-4" aria-label="Summary">
+  <div class="stat">
+    <div class="label">Active trackers</div>
+    <div class="value num">{{ active_count }}</div>
+    <div class="note">{{ rows|length }} total{% if stale_count %} · {{ stale_count }} stale{% endif %}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Under threshold</div>
+    <div class="value num">{{ under_threshold|length }}</div>
+    <div class="note">Latest observed fare at or below the configured threshold</div>
+  </div>
+  <div class="stat">
+    <div class="label">Provider searches used</div>
+    <div class="value num">{{ quota.effective_used }} / {{ quota.monthly_limit }}</div>
+    <div class="progress {{ 'danger' if quota.used_percent > 90 else ('warn' if quota.used_percent > 70 else '') }}" role="img"
+         aria-label="{{ quota.used_percent }} percent of the monthly allowance used">
+      <span style="width: {{ quota.used_percent }}%"></span>
+    </div>
+    <div class="note">{{ quota.remaining_safe }} available to automation ({{ quota.reserve }} reserved) · period {{ quota.period }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Scheduler</div>
+    <div class="value">
+      {% if scheduler.running %}
+      <span class="badge badge-ok">Running</span>
+      {% else %}
+      <span class="badge badge-warning">Not running</span>
+      {% endif %}
+    </div>
+    <div class="note">{{ scheduler.detail }}</div>
+  </div>
+</section>
+
+{% if quota.automation_blocked %}
+<div class="notice notice-warning" role="status">
+  <strong>Scheduled checks are paused.</strong>
+  {{ quota.remaining_hard }} provider search(es) remain this period and
+  {{ quota.reserve }} are held in reserve for manual checks. Automation resumes when the
+  allowance resets, or after you lower a tracker's check frequency.
+</div>
+{% endif %}
+
+{% if rows %}
+<section class="card" aria-labelledby="trackers-heading">
+  <div class="card-head">
+    <h2 id="trackers-heading">Trackers</h2>
+    <a class="small" href="/trackers">Full list</a>
+  </div>
+  <div class="table-wrap">
+    <table class="stacked">
+      <caption class="visually-hidden">Current observed fares by tracker</caption>
+      <thead>
+        <tr>
+          <th scope="col">Tracker</th>
+          <th scope="col">Latest observed</th>
+          <th scope="col">Observed low</th>
+          <th scope="col">Threshold</th>
+          <th scope="col">Status</th>
+          <th scope="col">Next check</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td data-label="Tracker">
+            <a href="/trackers/{{ row.tracker.id }}"><strong>{{ row.tracker.name }}</strong></a>
+            <span class="small muted" style="display:block">
+              {{ row.tracker.route }} · {{ row.tracker.passenger_summary }}
+            </span>
+          </td>
+          <td data-label="Latest observed" class="num">
+            {{ row.latest_price | money(row.tracker.currency) }}
+            {% if row.under_threshold %}<span class="badge badge-ok">At/below threshold</span>{% endif %}
+          </td>
+          <td data-label="Observed low" class="num">{{ row.low_price | money(row.tracker.currency) }}</td>
+          <td data-label="Threshold" class="num">{{ row.threshold | money(row.tracker.currency) }}</td>
+          <td data-label="Status">
+            <span class="badge badge-{{ row.status_tone }}">{{ row.status_label }}</span>
+          </td>
+          <td data-label="Next check" class="num">
+            {% if row.tracker.status == 'active' %}{{ row.next_run_at | relative }}{% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% else %}
+<section class="card empty-state">
+  <h2>No trackers yet</h2>
+  <p>
+    Create a tracker with a route, passengers, dates and a price threshold. FlightNotify
+    records every fare it observes and messages you on Telegram when your threshold is
+    reached or a new observed low appears.
+  </p>
+  <a class="btn btn-primary" href="/trackers/new">Create your first tracker</a>
+</section>
+{% endif %}
+
+<div class="grid grid-2">
+  <section class="card" aria-labelledby="next-heading">
+    <h2 id="next-heading">Next scheduled checks</h2>
+    {% if upcoming %}
+    <dl class="kv">
+      {% for row in upcoming %}
+      <dt><a href="/trackers/{{ row.tracker.id }}">{{ row.tracker.name }}</a></dt>
+      <dd class="num">{{ row.next_run_at | relative }} <span class="small muted">({{ row.next_run_at | dt }})</span></dd>
+      {% endfor %}
+    </dl>
+    {% else %}
+    <p class="muted small">Nothing is scheduled. Trackers must be active and the scheduler running.</p>
+    {% endif %}
+    {% if not scheduler.running %}
+    <p class="small notice notice-warning" style="margin-top:.6rem">
+      Automated checks only happen while the web application is running with
+      <code>SCHEDULER_ENABLED=true</code>, or while <code>flightnotify check-once</code>
+      is invoked by cron or a systemd timer.
+    </p>
+    {% endif %}
+  </section>
+
+  <section class="card" aria-labelledby="alerts-heading">
+    <h2 id="alerts-heading">Recent alerts</h2>
+    {% if recent_alerts %}
+    <div class="table-wrap">
+      <table class="stacked">
+        <thead>
+          <tr><th scope="col">When</th><th scope="col">Type</th><th scope="col">Delivery</th></tr>
+        </thead>
+        <tbody>
+          {% for alert in recent_alerts %}
+          <tr>
+            <td data-label="When" class="num">{{ alert.created_at | dt }}</td>
+            <td data-label="Type">{{ alert_type_labels.get(alert.alert_type, alert.alert_type) }}</td>
+            <td data-label="Delivery">
+              <span class="badge badge-{{ 'ok' if alert.delivery_state == 'sent' else ('danger' if alert.delivery_state == 'failed' else 'muted') }}">
+                {{ delivery_state_labels.get(alert.delivery_state, alert.delivery_state) }}
+              </span>
+              {% if alert.last_error %}<span class="small muted" style="display:block">{{ alert.last_error }}</span>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="muted small">No alerts have been generated yet.</p>
+    {% endif %}
+  </section>
+</div>
+
+{% if recent_failures %}
+<section class="card" aria-labelledby="failures-heading">
+  <h2 id="failures-heading">Recent failed or skipped checks</h2>
+  <div class="table-wrap">
+    <table class="stacked">
+      <thead>
+        <tr>
+          <th scope="col">Started</th><th scope="col">Status</th>
+          <th scope="col">Market</th><th scope="col">Reason</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in recent_failures %}
+        <tr>
+          <td data-label="Started" class="num">{{ run.started_at | dt }}</td>
+          <td data-label="Status"><span class="badge badge-warning">{{ run_status_labels.get(run.status, run.status) }}</span></td>
+          <td data-label="Market"><span class="pill">{{ run.market|upper }}</span></td>
+          <td data-label="Reason">{{ run.error_message or run.skip_reason or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+{% endblock %}

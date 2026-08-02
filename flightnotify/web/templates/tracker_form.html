@@ -1,0 +1,436 @@
+{% extends "base.html" %}
+
+{% macro err(field) %}
+  {% if errors.get(field) %}
+  <span class="error-text" id="{{ field }}-error">{{ errors[field] }}</span>
+  {% endif %}
+{% endmacro %}
+
+{% macro attrs(field) %}{% if errors.get(field) %}aria-invalid="true" aria-describedby="{{ field }}-error"{% endif %}{% endmacro %}
+
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>{{ 'Edit tracker' if tracker else 'New tracker' }}</h1>
+    <p class="sub">
+      Saving does not search on its own except when a tracker is first created.
+      Changing a field never triggers a provider call.
+    </p>
+  </div>
+</div>
+
+{% if errors %}
+<div class="error-summary" role="alert" tabindex="-1" id="error-summary">
+  <strong>{{ errors|length }} problem{{ '' if errors|length == 1 else 's' }} stopped this from being saved.</strong>
+  <p class="small" style="margin:.3rem 0 0">Nothing was changed. Your existing data is safe.</p>
+  <ul>
+    {% for field, message in errors.items() %}
+    <li><a href="#{{ field }}">{{ message }}</a></li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<form method="post"
+      action="{{ '/trackers/' ~ tracker.id if tracker else '/trackers' }}"
+      data-estimate-url="/api/estimate"
+      novalidate>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <fieldset>
+    <legend>Basics</legend>
+
+    <div class="field">
+      <label for="name">Tracker name</label>
+      <input type="text" id="name" name="name" maxlength="120" required
+             value="{{ form.name }}" {{ attrs('name') }}>
+      <span class="hint">For example “Tokyo autumn trip”.</span>
+      {{ err('name') }}
+    </div>
+
+    <div class="inline-fields">
+      <div class="field">
+        <label for="origin">Origin airport (IATA)</label>
+        <input type="text" id="origin" name="origin" maxlength="3" size="3"
+               autocapitalize="characters" spellcheck="false" required
+               value="{{ form.origin }}" {{ attrs('origin') }}>
+        <span class="hint">3 letters, e.g. SFO</span>
+        {{ err('origin') }}
+      </div>
+      <div class="field">
+        <label for="destination">Destination airport (IATA)</label>
+        <input type="text" id="destination" name="destination" maxlength="3" size="3"
+               autocapitalize="characters" spellcheck="false" required
+               value="{{ form.destination }}" {{ attrs('destination') }}>
+        <span class="hint">3 letters, e.g. NRT</span>
+        {{ err('destination') }}
+      </div>
+      <div class="field">
+        <label for="cabin">Cabin</label>
+        <select id="cabin" name="cabin" {{ attrs('cabin') }}>
+          {% for value, label in cabins %}
+          <option value="{{ value }}" {{ 'selected' if form.cabin == value }}>{{ cabin_labels.get(value, label) }}</option>
+          {% endfor %}
+        </select>
+        {{ err('cabin') }}
+      </div>
+    </div>
+    <p class="small muted">FlightNotify tracks round trips only.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Passengers</legend>
+    <div class="inline-fields" id="adults">
+      {% for key, label, min_value in [
+          ('adults', 'Adults', 1), ('children', 'Children', 0),
+          ('infants_in_seat', 'Infants in seat', 0), ('infants_on_lap', 'Lap infants', 0)] %}
+      <div class="field">
+        <label for="{{ key }}-input">{{ label }}</label>
+        <div class="stepper" data-stepper>
+          <button type="button" data-step="-1" aria-label="Decrease {{ label|lower }}">−</button>
+          <input type="number" id="{{ key }}-input" name="{{ key }}" min="{{ min_value }}" max="9"
+                 inputmode="numeric" value="{{ form[key] }}"
+                 {% if errors.get('adults') %}aria-describedby="adults-error"{% endif %}>
+          <button type="button" data-step="1" aria-label="Increase {{ label|lower }}">+</button>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {{ err('adults') }}
+    <p class="small muted">
+      Google Flights allows at most 9 passengers per search. Lap infants are excluded from
+      any per-traveler calculation because they do not occupy a seat.
+    </p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Dates</legend>
+    <div id="date_mode" role="radiogroup" aria-labelledby="date-mode-label">
+      <span class="field-label" id="date-mode-label">Date mode</span>
+      {% for mode in date_modes %}
+      <div class="check-row">
+        <input type="radio" id="mode-{{ mode.value }}" name="date_mode" value="{{ mode.value }}"
+               {{ 'checked' if form.date_mode == mode.value }}>
+        <label for="mode-{{ mode.value }}">
+          <strong>{{ date_mode_labels.get(mode.value, mode.value) }}</strong>
+          <span class="hint">
+            {% if mode.value == 'exact' %}
+            One outbound and one return date. One provider search per country market.
+            {% elif mode.value == 'flexible_preset' %}
+            A travel month plus a supported trip length. Uses the Google Travel Explore
+            endpoint; the provider chooses the exact dates.
+            {% else %}
+            A date window you define. FlightNotify generates every valid date pair and works
+            through them across scheduled runs, within the quota.
+            {% endif %}
+          </span>
+        </label>
+      </div>
+      {% endfor %}
+    </div>
+    {{ err('date_mode') }}
+
+    <div data-date-group="exact" {% if form.date_mode != 'exact' %}hidden{% endif %}>
+      <div class="inline-fields">
+        <div class="field">
+          <label for="outbound_date">Outbound date</label>
+          <input type="date" id="outbound_date" name="outbound_date" min="{{ today }}"
+                 value="{{ form.outbound_date.isoformat() if form.outbound_date else '' }}"
+                 {{ attrs('outbound_date') }}>
+          {{ err('outbound_date') }}
+        </div>
+        <div class="field">
+          <label for="return_date">Return date</label>
+          <input type="date" id="return_date" name="return_date" min="{{ today }}"
+                 value="{{ form.return_date.isoformat() if form.return_date else '' }}"
+                 {{ attrs('return_date') }}>
+          {{ err('return_date') }}
+        </div>
+      </div>
+    </div>
+
+    <div data-date-group="flexible_preset" {% if form.date_mode != 'flexible_preset' %}hidden{% endif %}>
+      <div class="inline-fields">
+        <div class="field">
+          <label for="flex_month">Travel month</label>
+          <select id="flex_month" name="flex_month" {{ attrs('flex_month') }}>
+            <option value="">Choose a month</option>
+            {% for index, month in [(1,'January'),(2,'February'),(3,'March'),(4,'April'),(5,'May'),(6,'June'),(7,'July'),(8,'August'),(9,'September'),(10,'October'),(11,'November'),(12,'December')] %}
+            <option value="{{ index }}" {{ 'selected' if form.flex_month == index }}>{{ month }}</option>
+            {% endfor %}
+          </select>
+          <span class="hint">Google Travel Explore only supports the next 6 months.</span>
+          {{ err('flex_month') }}
+        </div>
+        <div class="field">
+          <label for="flex_duration">Trip length</label>
+          <select id="flex_duration" name="flex_duration" {{ attrs('flex_duration') }}>
+            <option value="">Choose a length</option>
+            {% for duration in flex_durations %}
+            <option value="{{ duration.value }}" {{ 'selected' if form.flex_duration == duration.value }}>
+              {{ flex_duration_labels.get(duration.value, duration.value) }}
+            </option>
+            {% endfor %}
+          </select>
+          {{ err('flex_duration') }}
+        </div>
+      </div>
+      <p class="small muted">
+        The provider returns the dates it found. FlightNotify stores those dates exactly as
+        supplied rather than recomputing them.
+      </p>
+    </div>
+
+    <div data-date-group="custom_window" {% if form.date_mode != 'custom_window' %}hidden{% endif %}>
+      <div class="inline-fields">
+        <div class="field">
+          <label for="window_outbound_start">Earliest departure</label>
+          <input type="date" id="window_outbound_start" name="window_outbound_start" min="{{ today }}"
+                 value="{{ form.window_outbound_start.isoformat() if form.window_outbound_start else '' }}"
+                 {{ attrs('window_outbound_start') }}>
+          {{ err('window_outbound_start') }}
+        </div>
+        <div class="field">
+          <label for="window_outbound_end">Latest departure</label>
+          <input type="date" id="window_outbound_end" name="window_outbound_end" min="{{ today }}"
+                 value="{{ form.window_outbound_end.isoformat() if form.window_outbound_end else '' }}"
+                 {{ attrs('window_outbound_end') }}>
+          {{ err('window_outbound_end') }}
+        </div>
+      </div>
+      <p class="small muted">Then set <em>either</em> a return window <em>or</em> a trip length in nights.</p>
+      <div class="inline-fields">
+        <div class="field">
+          <label for="window_return_start">Earliest return</label>
+          <input type="date" id="window_return_start" name="window_return_start" min="{{ today }}"
+                 value="{{ form.window_return_start.isoformat() if form.window_return_start else '' }}"
+                 {{ attrs('window_return_start') }}>
+          {{ err('window_return_start') }}
+        </div>
+        <div class="field">
+          <label for="window_return_end">Latest return</label>
+          <input type="date" id="window_return_end" name="window_return_end" min="{{ today }}"
+                 value="{{ form.window_return_end.isoformat() if form.window_return_end else '' }}"
+                 {{ attrs('window_return_end') }}>
+          {{ err('window_return_end') }}
+        </div>
+        <div class="field">
+          <label for="min_nights">Minimum nights</label>
+          <input type="number" id="min_nights" name="min_nights" min="1" max="60" inputmode="numeric"
+                 value="{{ form.min_nights if form.min_nights is not none else '' }}" {{ attrs('min_nights') }}>
+          {{ err('min_nights') }}
+        </div>
+        <div class="field">
+          <label for="max_nights">Maximum nights</label>
+          <input type="number" id="max_nights" name="max_nights" min="1" max="60" inputmode="numeric"
+                 value="{{ form.max_nights if form.max_nights is not none else '' }}" {{ attrs('max_nights') }}>
+          {{ err('max_nights') }}
+        </div>
+      </div>
+      <div class="field">
+        <label for="candidates_per_run">Date combinations checked per run</label>
+        <input type="number" id="candidates_per_run" name="candidates_per_run" min="1" max="10"
+               inputmode="numeric" value="{{ form.candidates_per_run }}" {{ attrs('candidates_per_run') }}>
+        <span class="hint">
+          Combinations are visited in a deterministic order that samples across the whole
+          window early, so a partial scan is representative rather than front-loaded.
+        </span>
+        {{ err('candidates_per_run') }}
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Price threshold</legend>
+    <div class="inline-fields">
+      <div class="field">
+        <label for="threshold_amount">Alert threshold</label>
+        <input type="text" id="threshold_amount" name="threshold_amount" inputmode="decimal" required
+               value="{{ form.threshold_amount if form.threshold_amount > 0 else '' }}"
+               {{ attrs('threshold_amount') }}>
+        <span class="hint">A fare at or below this value counts as reaching the threshold.</span>
+        {{ err('threshold_amount') }}
+      </div>
+      <div class="field">
+        <label for="currency">Comparison currency</label>
+        <select id="currency" name="currency" {{ attrs('currency') }}>
+          {% for code in currency_choices %}
+          <option value="{{ code }}" {{ 'selected' if form.currency == code }}>{{ code }}</option>
+          {% endfor %}
+        </select>
+        <span class="hint">The same currency is requested for every country market.</span>
+        {{ err('currency') }}
+      </div>
+    </div>
+    <div id="threshold_basis" role="radiogroup" aria-labelledby="basis-label">
+      <span class="field-label" id="basis-label">Threshold applies to</span>
+      {% for basis in threshold_bases %}
+      <div class="check-row">
+        <input type="radio" id="basis-{{ basis.value }}" name="threshold_basis" value="{{ basis.value }}"
+               {{ 'checked' if form.threshold_basis == basis.value }}>
+        <label for="basis-{{ basis.value }}">
+          {{ 'The complete passenger party' if basis.value == 'party' else 'One traveler' }}
+        </label>
+      </div>
+      {% endfor %}
+    </div>
+    {{ err('threshold_basis') }}
+    <p class="small muted">
+      SerpApi is configured to report prices as
+      <strong>{{ settings_public.price_scope.replace('_', ' ') }}</strong>
+      (<code>SERPAPI_PRICE_SCOPE</code>). Any value derived from the other basis is labelled
+      “calculated” wherever it is shown.
+    </p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Country markets</legend>
+    <div class="market-grid" id="markets" role="group" aria-describedby="markets-hint">
+      {% for code, label in market_choices %}
+      <div class="check-row">
+        <input type="checkbox" id="market-{{ code }}" name="markets" value="{{ code }}"
+               {{ 'checked' if code in form.markets }}>
+        <label for="market-{{ code }}">{{ label }} <span class="pill">{{ code|upper }}</span></label>
+      </div>
+      {% endfor %}
+    </div>
+    <span class="hint" id="markets-hint">
+      Each selected market costs one provider search per scan. Results are compared in a
+      single currency, and the winning market is shown beside the fare.
+    </span>
+    {{ err('markets') }}
+    <p class="small muted">
+      Regional price comparison only. A fare found in another country market may carry
+      point-of-sale, residency, payment-method, tax or booking restrictions, and is not
+      guaranteed to be bookable from where you are.
+    </p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Alerts and schedule</legend>
+    <div class="check-row">
+      <input type="checkbox" id="alert_on_threshold" name="alert_on_threshold" value="1"
+             {{ 'checked' if form.alert_on_threshold }}>
+      <label for="alert_on_threshold">Alert when the threshold is reached</label>
+    </div>
+    <div class="check-row">
+      <input type="checkbox" id="alert_on_new_low" name="alert_on_new_low" value="1"
+             {{ 'checked' if form.alert_on_new_low }}>
+      <label for="alert_on_new_low">Alert on a new observed low</label>
+    </div>
+    {{ err('alert_on_threshold') }}
+
+    <div class="field">
+      <label for="check_interval_minutes">Check frequency</label>
+      <select id="check_interval_minutes" name="check_interval_minutes" {{ attrs('check_interval_minutes') }}>
+        {% for value, label in schedule_choices %}
+        <option value="{{ value }}" {{ 'selected' if form.check_interval_minutes == value }}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      {{ err('check_interval_minutes') }}
+    </div>
+  </fieldset>
+
+  <details class="advanced" {% if errors.get('include_airlines') or errors.get('exclude_airlines') or errors.get('min_drop_absolute') or errors.get('min_drop_percent') or errors.get('cooldown_minutes') or errors.get('stops') %}open{% endif %}>
+    <summary>Advanced filters and alert tuning</summary>
+
+    <div class="field">
+      <label for="stops">Stops</label>
+      <select id="stops" name="stops" {{ attrs('stops') }}>
+        {% for option in stops_options %}
+        <option value="{{ option.value }}" {{ 'selected' if form.stops == option.value }}>
+          {{ stops_labels.get(option.value, option.value) }}
+        </option>
+        {% endfor %}
+      </select>
+      {{ err('stops') }}
+    </div>
+
+    <div class="inline-fields">
+      <div class="field">
+        <label for="include_airlines">Only these airlines</label>
+        <input type="text" id="include_airlines" name="include_airlines" placeholder="UA,NH"
+               value="{{ form.include_airlines or '' }}" {{ attrs('include_airlines') }}>
+        <span class="hint">Comma-separated 2-character IATA codes. Cannot be combined with exclusions.</span>
+        {{ err('include_airlines') }}
+      </div>
+      <div class="field">
+        <label for="exclude_airlines">Exclude these airlines</label>
+        <input type="text" id="exclude_airlines" name="exclude_airlines" placeholder="F9"
+               value="{{ form.exclude_airlines or '' }}" {{ attrs('exclude_airlines') }}>
+        {{ err('exclude_airlines') }}
+      </div>
+    </div>
+
+    <div class="inline-fields">
+      <div class="field">
+        <label for="min_drop_absolute">Minimum drop before another alert</label>
+        <input type="text" id="min_drop_absolute" name="min_drop_absolute" inputmode="decimal"
+               value="{{ form.min_drop_absolute if form.min_drop_absolute is not none else '' }}"
+               {{ attrs('min_drop_absolute') }}>
+        <span class="hint">Absolute amount in the comparison currency. Leave blank for none.</span>
+        {{ err('min_drop_absolute') }}
+      </div>
+      <div class="field">
+        <label for="min_drop_percent">Minimum drop (%)</label>
+        <input type="text" id="min_drop_percent" name="min_drop_percent" inputmode="decimal"
+               value="{{ form.min_drop_percent if form.min_drop_percent is not none else '' }}"
+               {{ attrs('min_drop_percent') }}>
+        {{ err('min_drop_percent') }}
+      </div>
+      <div class="field">
+        <label for="cooldown_minutes">Alert cooldown (minutes)</label>
+        <input type="number" id="cooldown_minutes" name="cooldown_minutes" min="0" max="10080"
+               inputmode="numeric" value="{{ form.cooldown_minutes }}" {{ attrs('cooldown_minutes') }}>
+        <span class="hint">Applied per alert type. 0 disables the cooldown.</span>
+        {{ err('cooldown_minutes') }}
+      </div>
+    </div>
+  </details>
+
+  <section class="card" aria-labelledby="budget-heading">
+    <h2 id="budget-heading">Provider call budget</h2>
+    <div id="budget-estimate" class="budget-box {{ ('notice-success' if verdict.severity == 'ok' else ('notice-danger' if verdict.severity == 'blocked' else 'notice-warning')) if verdict else '' }}"
+         {% if not verdict %}hidden{% endif %} aria-live="polite">
+      {% if verdict %}
+      <p class="headline">{{ verdict.headline }}</p>
+      <p>{{ verdict.detail }}</p>
+      {% if verdict.suggestions %}
+      <ul>{% for suggestion in verdict.suggestions %}<li>{{ suggestion }}</li>{% endfor %}</ul>
+      {% endif %}
+      {% endif %}
+    </div>
+    <p class="small muted" style="margin-top:.6rem">
+      {{ quota.remaining_safe }} of {{ quota.monthly_limit }} provider searches are available
+      to automation this period ({{ quota.reserve }} held in reserve for manual checks).
+      Estimates exclude cached results, which are never billable.
+    </p>
+
+    <div class="check-row" id="sampled-mode-row" {% if not verdict or verdict.fits %}hidden{% endif %}>
+      <input type="checkbox" id="sampled_mode_ack" name="sampled_mode_ack" value="1"
+             {{ 'checked' if form.sampled_mode_ack }}
+             {% if errors.get('sampled_mode_ack') %}aria-invalid="true" aria-describedby="sampled_mode_ack-error"{% endif %}>
+      <label for="sampled_mode_ack">
+        Continue in <strong>sampled mode</strong>: I understand this configuration will not
+        complete a full sweep within the remaining free allowance, and results will be
+        labelled as a partial scan.
+      </label>
+    </div>
+    {{ err('sampled_mode_ack') }}
+  </section>
+
+  <div class="btn-row">
+    <button class="btn btn-primary" type="submit">
+      {{ 'Save changes' if tracker else 'Create tracker' }}
+    </button>
+    <a class="btn" href="{{ '/trackers/' ~ tracker.id if tracker else '/trackers' }}">Cancel</a>
+  </div>
+  {% if not tracker %}
+  <p class="small muted" style="margin-top:.5rem">
+    Creating a tracker runs one immediate search if the allowance permits it.
+  </p>
+  {% endif %}
+</form>
+
+{% endblock %}

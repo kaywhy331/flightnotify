@@ -1,0 +1,30 @@
+# Secrets and local state - never commit these.
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-wal
+*.db-shm
+secret_key
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,48 @@
+{
+  "search_metadata": {
+    "id": "66ab1f2c3d4e5f6a7b8c9d11",
+    "status": "Success",
+    "created_at": "2026-08-01 09:20:11 UTC",
+    "processed_at": "2026-08-01 09:20:14 UTC",
+    "google_travel_explore_url": "https://www.google.com/travel/explore?hl=en&gl=us&curr=USD&tfs=EXPLORETOKEN",
+    "total_time_taken": 3.02
+  },
+  "search_parameters": {
+    "engine": "google_travel_explore",
+    "hl": "en",
+    "gl": "us",
+    "departure_id": "SFO",
+    "arrival_id": "NRT",
+    "currency": "USD",
+    "adults": 2,
+    "travel_class": 1,
+    "type": 1,
+    "month": 11,
+    "travel_duration": 2
+  },
+  "start_date": "2026-11-07",
+  "end_date": "2026-11-14",
+  "google_flights_link": "https://www.google.com/travel/flights?hl=en&gl=us&curr=USD&tfs=FLIGHTSTOKEN",
+  "google_flights_serpapi_link": "https://serpapi.com/search.json?engine=google_flights&arrival_id=NRT&departure_id=SFO",
+  "flights": [
+    {
+      "departure_airport": { "name": "San Francisco International Airport", "id": "SFO" },
+      "arrival_airport": { "name": "Tokyo Narita International Airport", "id": "NRT" },
+      "duration": 655,
+      "price": 986,
+      "cheapest_flight": true,
+      "number_of_stops": 0,
+      "airline": "ZIPAIR",
+      "airline_code": "ZG"
+    },
+    {
+      "departure_airport": { "name": "San Francisco International Airport", "id": "SFO" },
+      "arrival_airport": { "name": "Tokyo Narita International Airport", "id": "NRT" },
+      "duration": 880,
+      "price": 1104,
+      "number_of_stops": 1,
+      "airline": "Alaska and Japan Airlines",
+      "airline_code": "multi"
+    }
+  ]
+}

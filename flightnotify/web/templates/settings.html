@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>Settings</h1>
+    <p class="sub">Credentials live in your <code>.env</code> file and are never stored in the database.</p>
+  </div>
+</div>
+
+<section class="card" aria-labelledby="provider-heading">
+  <div class="card-head">
+    <h2 id="provider-heading">Airfare provider — SerpApi</h2>
+    {% if settings_public.has_provider %}
+    <span class="badge badge-ok">Key configured</span>
+    {% else %}
+    <span class="badge badge-danger">Not configured</span>
+    {% endif %}
+  </div>
+
+  {% if settings_public.has_provider %}
+  <dl class="kv">
+    <dt>Account</dt><dd>{{ quota.provider_account_masked or 'Not synced yet' }}</dd>
+    <dt>Plan</dt><dd>{{ quota.provider_plan or 'Unknown until synced' }}</dd>
+    <dt>Provider searches left</dt>
+    <dd class="num">{{ quota.provider_left if quota.provider_left is not none else 'Unknown' }}</dd>
+    <dt>Provider usage this month</dt>
+    <dd class="num">{{ quota.provider_used if quota.provider_used is not none else 'Unknown' }}</dd>
+    <dt>Locally counted searches</dt><dd class="num">{{ quota.local_used }}</dd>
+    <dt>Configured cap</dt>
+    <dd class="num">{{ quota.monthly_limit }} per month, {{ quota.reserve }} held in reserve</dd>
+    <dt>Available to automation</dt><dd class="num">{{ quota.remaining_safe }}</dd>
+    <dt>Hourly throughput</dt>
+    <dd class="num">{{ quota.hourly_used }} of {{ quota.hourly_limit }} used in the last hour</dd>
+    <dt>Last synced</dt><dd>{{ quota.last_synced_at | dt }}</dd>
+    <dt>Price basis</dt>
+    <dd>
+      <code>{{ settings_public.price_scope }}</code> —
+      how FlightNotify interprets the provider's <code>price</code> field. SerpApi does not
+      document this; change <code>SERPAPI_PRICE_SCOPE</code> if your account behaves
+      differently.
+    </dd>
+  </dl>
+  {% if quota.sync_error %}
+  <div class="notice notice-danger" role="status">{{ quota.sync_error }}</div>
+  {% endif %}
+  <form method="post" action="/settings/quota/refresh">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="btn" type="submit">Refresh quota from SerpApi</button>
+    <span class="hint">Reading account status is free and is not counted as a search.</span>
+  </form>
+  {% else %}
+  <div class="notice notice-warning">
+    <strong>No SerpApi key is configured.</strong>
+    FlightNotify will not search and will not display any fare data until one is added.
+    Nothing you have stored is affected.
+  </div>
+  <ol class="small">
+    <li>Create a free account at <a href="https://serpapi.com/users/sign_up" rel="noopener noreferrer" target="_blank">serpapi.com</a>. The free plan currently allows 250 searches per month and 50 per hour.</li>
+    <li>Copy your private key from <a href="https://serpapi.com/manage-api-key" rel="noopener noreferrer" target="_blank">Manage API key</a>.</li>
+    <li>Put it in <code>.env</code> as <code>SERPAPI_API_KEY=…</code>.</li>
+    <li>Restart FlightNotify.</li>
+  </ol>
+  {% endif %}
+</section>
+
+<section class="card" aria-labelledby="telegram-heading">
+  <div class="card-head">
+    <h2 id="telegram-heading">Telegram alerts</h2>
+    {% if telegram.ready %}
+    <span class="badge badge-ok">Ready</span>
+    {% elif telegram.configured %}
+    <span class="badge badge-warning">Token set, no chat connected</span>
+    {% else %}
+    <span class="badge badge-danger">Not configured</span>
+    {% endif %}
+  </div>
+
+  <dl class="kv">
+    <dt>Bot token</dt>
+    <dd>{{ telegram.token_hint or 'Not set' }} <span class="small muted">(never shown in full, never stored in the database)</span></dd>
+    <dt>Chat id</dt><dd>{{ telegram.chat_id or 'Not set' }}</dd>
+    <dt>Source</dt><dd>{{ telegram.chat_source }}</dd>
+  </dl>
+
+  {% if not telegram.configured %}
+  <div class="notice notice-warning">
+    <strong>No bot token.</strong> Price observations are still recorded, but no alert can be
+    delivered.
+  </div>
+  {% endif %}
+
+  <ol class="small">
+    <li>In Telegram, open a chat with <strong>@BotFather</strong> and send <code>/newbot</code>.</li>
+    <li>Follow the prompts; BotFather replies with an HTTP API token.</li>
+    <li>Put it in <code>.env</code> as <code>TELEGRAM_BOT_TOKEN=…</code> and restart FlightNotify.</li>
+    <li>Open a chat with your new bot and send <code>/start</code> — Telegram will not deliver
+        bot messages to you until you do.</li>
+    <li>Either set <code>TELEGRAM_CHAT_ID</code> in <code>.env</code>, or use
+        <strong>Discover chat</strong> below.</li>
+  </ol>
+
+  <div class="btn-row">
+    <form method="post" action="/settings/telegram/discover" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit" {% if not telegram.configured %}disabled{% endif %}>Discover chat</button>
+    </form>
+    <form method="post" action="/settings/telegram/test" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit" {% if not telegram.ready %}disabled{% endif %}>Send test message</button>
+    </form>
+  </div>
+  <p class="small muted">
+    Discovery reads recent direct messages sent to your bot. Telegram keeps them for 24 hours
+    and this does not work while the bot has a webhook configured.
+  </p>
+
+  {% if discovered %}
+  <h3>Choose a chat</h3>
+  <div class="table-wrap">
+    <table class="stacked">
+      <thead><tr><th scope="col">Chat</th><th scope="col">Last message</th><th scope="col"><span class="visually-hidden">Use</span></th></tr></thead>
+      <tbody>
+        {% for chat in discovered %}
+        <tr>
+          <td data-label="Chat">{{ chat.name }} <span class="pill">{{ chat.chat_id }}</span></td>
+          <td data-label="Last message" class="small wrap-any">{{ chat.last_text }}</td>
+          <td data-label="">
+            <form method="post" action="/settings/telegram/chat" class="inline">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="chat_id" value="{{ chat.chat_id }}">
+              <button class="btn btn-small btn-primary" type="submit">Use this chat</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+
+<div class="grid grid-2">
+  <section class="card" aria-labelledby="defaults-heading">
+    <h2 id="defaults-heading">Defaults for new trackers</h2>
+    <form method="post" action="/settings/defaults">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field">
+        <label for="default_market">Default country market</label>
+        <select id="default_market" name="default_market">
+          {% for code, label in market_choices %}
+          <option value="{{ code }}" {{ 'selected' if settings_public.default_market == code }}>{{ label }} ({{ code|upper }})</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="default_currency">Default currency</label>
+        <select id="default_currency" name="default_currency">
+          {% for code in currency_choices %}
+          <option value="{{ code }}" {{ 'selected' if settings_public.default_currency == code }}>{{ code }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <button class="btn" type="submit">Save defaults</button>
+    </form>
+    <dl class="kv" style="margin-top:.9rem">
+      <dt>Timezone</dt>
+      <dd>{{ settings_public.timezone }} <span class="small muted">(set with <code>APP_TIMEZONE</code>; all timestamps are stored in UTC)</span></dd>
+      <dt>Quota reserve</dt>
+      <dd class="num">{{ settings_public.reserve }} <span class="small muted">(set with <code>SERPAPI_RESERVE_SEARCHES</code>)</span></dd>
+      <dt>Monthly cap</dt>
+      <dd class="num">{{ settings_public.monthly_limit }} <span class="small muted">(set with <code>SERPAPI_MONTHLY_SEARCH_LIMIT</code>)</span></dd>
+    </dl>
+  </section>
+
+  <section class="card" aria-labelledby="scheduler-heading">
+    <h2 id="scheduler-heading">Scheduler</h2>
+    <dl class="kv">
+      <dt>State</dt>
+      <dd>
+        {% if scheduler.running %}<span class="badge badge-ok">Running</span>
+        {% else %}<span class="badge badge-warning">Not running</span>{% endif %}
+      </dd>
+      <dt>Holder</dt><dd class="mono wrap-any">{{ scheduler.owner or '—' }}</dd>
+      <dt>Last tick</dt><dd>{{ scheduler.last_tick_at | dt }}</dd>
+      <dt>Ticks</dt><dd class="num">{{ scheduler.tick_count }}</dd>
+    </dl>
+    <p class="small">{{ scheduler.detail }}</p>
+    {% if scheduler.last_error %}
+    <div class="notice notice-danger">{{ scheduler.last_error }}</div>
+    {% endif %}
+    <p class="small muted">
+      Only one process holds the scheduler lease at a time, so running the app with several
+      workers cannot double-check a tracker. For checks that continue when the web app is
+      not running, use <code>flightnotify check-once</code> from cron or a systemd timer.
+    </p>
+  </section>
+</div>
+
+<section class="card" aria-labelledby="setup-heading">
+  <h2 id="setup-heading">Setup status</h2>
+  <ul class="setup-list">
+    {% for item in setup['items'] %}
+    <li class="{{ 'done' if item.done else 'todo' }}">
+      <span class="mark" aria-hidden="true">{{ '✓' if item.done else '○' }}</span>
+      <span>
+        <strong>{{ item.label }}</strong>
+        <span class="visually-hidden">— {{ 'done' if item.done else 'not done yet' }}</span>
+        <span class="small muted" style="display:block">{{ item.detail }}</span>
+      </span>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+
+{% endblock %}

@@ -1,0 +1,373 @@
+{% extends "base.html" %}
+{% block content %}
+{% set t = tracker %}
+
+<div class="page-head">
+  <div>
+    <h1>{{ t.name }}</h1>
+    <p class="sub">
+      {{ t.route }} · {{ t.passenger_summary }} · {{ cabin_labels.get(t.cabin, t.cabin) }} ·
+      {{ stops_labels.get(t.stops, t.stops) }} · {{ t.currency }}
+      <span class="badge badge-{{ row.status_tone }}">{{ row.status_label }}</span>
+    </p>
+    <p class="sub">{{ row.status_explanation }}</p>
+  </div>
+  <div class="head-actions">
+    <form method="post" action="/trackers/{{ t.id }}/check" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn btn-primary" type="submit">Check now</button>
+    </form>
+    <form method="post" action="/trackers/{{ t.id }}/check" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="force" value="1">
+      <button class="btn" type="submit" title="Bypass the local query cache and spend a provider search">
+        Force fresh
+      </button>
+    </form>
+    <a class="btn" href="/trackers/{{ t.id }}/edit">Edit</a>
+    {% if t.status == 'active' %}
+    <form method="post" action="/trackers/{{ t.id }}/pause" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">Pause</button>
+    </form>
+    {% else %}
+    <form method="post" action="/trackers/{{ t.id }}/resume" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">Resume</button>
+    </form>
+    {% endif %}
+    <button class="btn btn-danger" type="button" data-dialog-open="delete-dialog">Delete</button>
+  </div>
+</div>
+
+<section class="card" aria-labelledby="current-heading">
+  <h2 id="current-heading">Current observed fare</h2>
+  <div class="headline-price">
+    <div>
+      <div class="amount num">{{ row.latest_price | money(t.currency) }}</div>
+      <div class="meta">
+        {{ 'per traveler' if t.threshold_basis == 'per_traveler' else 'total for ' ~ t.passenger_summary }}
+        · lowest observed by FlightNotify, not a guaranteed or predicted minimum
+      </div>
+    </div>
+    <dl class="kv">
+      <dt>Observed low</dt>
+      <dd class="num">{{ row.low_price | money(t.currency) }}
+        {% if t.low_observed_at %}<span class="small muted">({{ t.low_observed_at | dt }})</span>{% endif %}
+      </dd>
+      <dt>Threshold</dt>
+      <dd class="num">
+        {{ row.threshold | money(t.currency) }}
+        {% if row.under_threshold %}
+        <span class="badge badge-ok">At or below threshold</span>
+        {% else %}
+        <span class="badge badge-muted">Above threshold</span>
+        {% endif %}
+      </dd>
+      <dt>Last successful check</dt>
+      <dd>{{ row.last_success_at | dt }} <span class="small muted">({{ row.last_success_at | relative }})</span></dd>
+      <dt>Next check</dt>
+      <dd>{% if t.status == 'active' %}{{ row.next_run_at | dt }} <span class="small muted">({{ row.next_run_at | relative }})</span>{% else %}Paused{% endif %}</dd>
+      <dt>Freshness</dt>
+      <dd><span class="badge badge-{{ freshness_tone }}">{{ 'Fresh' if freshness_tone == 'ok' else ('Stale' if freshness_tone == 'warning' else 'No data') }}</span>
+        <span class="small muted">{{ freshness_text }}</span></dd>
+      <dt>Dates</dt>
+      <dd>{{ date_mode_labels.get(t.date_mode, t.date_mode) }} — {{ row.date_summary }}</dd>
+    </dl>
+  </div>
+
+  {% if row.coverage_label %}
+  <div class="notice {{ 'notice-info' if row.coverage.complete else 'notice-warning' }}" style="margin-top:.9rem">
+    <strong>{{ 'Complete scan' if row.coverage.complete else 'Partial scan' }}</strong>
+    {{ row.coverage_label }}
+    {% if not row.coverage.complete %}
+    Approximately {{ row.coverage.remaining }} more date combination(s)
+    ({{ row.coverage.remaining * (row.markets|length) }} provider searches) are needed to
+    finish this cycle. Figures above describe only the combinations checked so far.
+    {% endif %}
+    <div class="progress" role="img" style="margin-top:.5rem"
+         aria-label="{{ row.coverage.percent }} percent of date combinations checked in this cycle">
+      <span style="width: {{ row.coverage.percent }}%"></span>
+    </div>
+    {% if row.coverage.oldest_observation %}
+    <p class="small" style="margin:.5rem 0 0">
+      Oldest observation in this cycle: {{ row.coverage.oldest_observation | dt }} ·
+      Newest: {{ row.coverage.newest_observation | dt }}
+    </p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if t.last_error_message %}
+  <div class="notice notice-danger" style="margin-top:.9rem" role="status">
+    <strong>Last check reported a problem.</strong> {{ t.last_error_message }}
+  </div>
+  {% endif %}
+
+  <p class="disclaimer">
+    Prices are what FlightNotify observed at the times shown. Availability and price can
+    change before booking.
+  </p>
+</section>
+
+<section class="card" aria-labelledby="history-heading">
+  <div class="card-head">
+    <h2 id="history-heading">Price history</h2>
+    <span class="small muted">Current configuration series only ({{ points|length }} observations)</span>
+  </div>
+  <div class="chart-frame">{{ chart_svg|safe }}</div>
+
+  {% if points %}
+  <details style="margin-top:.75rem">
+    <summary>View the same data as a table</summary>
+    <div class="table-wrap">
+      <table class="stacked">
+        <caption class="visually-hidden">Observed fares over time</caption>
+        <thead>
+          <tr>
+            <th scope="col">Observed</th><th scope="col">Fare</th><th scope="col">Market</th>
+            <th scope="col">Dates</th><th scope="col">Stops</th><th scope="col">Airlines</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for point in points|reverse %}
+          <tr>
+            <td data-label="Observed" class="num">{{ point.observed_at | dt }}</td>
+            <td data-label="Fare" class="num">{{ point.amount | money(t.currency) }}</td>
+            <td data-label="Market"><span class="pill">{{ point.market|upper }}</span></td>
+            <td data-label="Dates" class="num">{{ point.outbound_date | d }} → {{ point.return_date | d }}</td>
+            <td data-label="Stops" class="num">{{ point.stops if point.stops is not none else '—' }}</td>
+            <td data-label="Airlines">{{ point.airlines|join(', ') if point.airlines else '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  {% endif %}
+</section>
+
+<div class="grid grid-2">
+  <section class="card" aria-labelledby="offers-heading">
+    <h2 id="offers-heading">Latest offers</h2>
+    {% if offers %}
+    <div class="table-wrap">
+      <table class="stacked">
+        <thead>
+          <tr>
+            <th scope="col">Fare</th><th scope="col">Itinerary</th>
+            <th scope="col">Eligible</th><th scope="col">Link</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for offer in offers %}
+          <tr>
+            <td data-label="Fare" class="num">
+              {{ offer.price_amount | money(offer.currency) }}
+              <span class="small muted" style="display:block">
+                {{ offer.price_scope.replace('_',' ') }}
+                {% if offer.per_traveler_amount is not none and offer.per_traveler_is_calculated %}
+                · {{ offer.per_traveler_amount | money(offer.currency) }}/traveler (calculated)
+                {% endif %}
+              </span>
+            </td>
+            <td data-label="Itinerary" class="itinerary-col">
+              {{ offer.airlines|join(', ') if offer.airlines else 'Airline not reported' }}
+              <span class="small muted" style="display:block">
+                {{ offer.outbound_date | d }} → {{ offer.return_date | d }} ·
+                {% if offer.stops is none %}stops unknown{% elif offer.stops == 0 %}nonstop{% else %}{{ offer.stops }} stop(s){% endif %}
+                {% if offer.duration_minutes %} · {{ (offer.duration_minutes // 60) }}h {{ offer.duration_minutes % 60 }}m{% endif %}
+                · <span class="pill">{{ offer.market|upper }}</span>
+              </span>
+              {% if offer.flight_numbers %}
+              <span class="small muted mono" style="display:block">{{ offer.flight_numbers|join(' · ') }}</span>
+              {% endif %}
+            </td>
+            <td data-label="Eligible">
+              {% if offer.eligible %}
+              <span class="badge badge-ok">Eligible</span>
+              {% else %}
+              <span class="badge badge-muted">Excluded</span>
+              <span class="small muted" style="display:block">{{ offer.exclusion_reason }}</span>
+              {% endif %}
+            </td>
+            <td data-label="Link">
+              {% if offer.booking_link or offer.search_link %}
+              <a href="{{ offer.booking_link or offer.search_link }}" rel="noopener noreferrer nofollow" target="_blank">
+                Open search<span class="visually-hidden"> for this fare on the provider's site (opens in a new tab)</span>
+              </a>
+              {% else %}
+              <span class="small muted">No provider link</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="small muted">
+      Links come from the provider response. FlightNotify does not construct booking URLs of
+      its own.
+    </p>
+    {% else %}
+    <p class="muted small">No offers stored yet for the current configuration.</p>
+    {% endif %}
+  </section>
+
+  <section class="card" aria-labelledby="markets-heading">
+    <h2 id="markets-heading">Regional price comparison</h2>
+    {% if markets %}
+    <div class="table-wrap">
+      <table class="stacked">
+        <thead>
+          <tr><th scope="col">Country market</th><th scope="col">Latest</th>
+              <th scope="col">Lowest observed</th><th scope="col">Observed</th></tr>
+        </thead>
+        <tbody>
+          {% for entry in markets %}
+          <tr>
+            <td data-label="Country market">
+              <span class="pill">{{ entry.market|upper }}</span>
+              {% if loop.first and entry.latest %}<span class="badge badge-ok">Cheapest observed</span>{% endif %}
+            </td>
+            <td data-label="Latest" class="num">
+              {{ entry.latest.price_amount | money(t.currency) if entry.latest else '—' }}
+            </td>
+            <td data-label="Lowest observed" class="num">
+              {{ entry.lowest.price_amount | money(t.currency) if entry.lowest else '—' }}
+            </td>
+            <td data-label="Observed" class="num">{{ entry.observed_at | dt }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+    <p class="small muted">
+      All markets are compared in {{ t.currency }} and every market costs one provider search
+      per scan. A cheaper market may have point-of-sale, residency, payment-method, tax or
+      booking restrictions and is not guaranteed to be bookable. FlightNotify does not use or
+      recommend a VPN.
+    </p>
+  </section>
+</div>
+
+{# These two tables are dense enough that a half-width column would squeeze the
+   detail text into an unreadable sliver, so they each take the full width. #}
+<section class="card" aria-labelledby="runs-heading">
+  <h2 id="runs-heading">Recent checks</h2>
+  <div class="table-wrap">
+    <table class="stacked">
+      <thead>
+        <tr>
+          <th scope="col">Started</th><th scope="col">Trigger</th><th scope="col">Status</th>
+          <th scope="col">Market</th><th scope="col">Calls</th>
+          <th scope="col">Dates</th><th scope="col">Detail</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in runs %}
+        <tr>
+          <td data-label="Started" class="num">{{ run.started_at | dt }}</td>
+          <td data-label="Trigger">{{ run.trigger }}</td>
+          <td data-label="Status">
+            <span class="badge badge-{{ run_tone(run.status) }}">{{ run_status_labels.get(run.status, run.status) }}</span>
+            {% if run.cache_status == 'hit' %}<span class="badge badge-info">Cached</span>{% endif %}
+            {% if run.cache_status == 'forced' %}<span class="badge badge-info">Forced fresh</span>{% endif %}
+          </td>
+          <td data-label="Market"><span class="pill">{{ run.market|upper }}</span></td>
+          <td data-label="Calls" class="num">{{ run.provider_request_count }}</td>
+          <td data-label="Dates" class="num">
+            {% if run.outbound_date %}{{ run.outbound_date | d }} → {{ run.return_date | d }}{% else %}—{% endif %}
+          </td>
+          <td data-label="Detail" class="detail-col">
+            {{ run.error_message or run.skip_reason or (run.offers_found ~ ' offer(s)') }}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="muted small">No checks recorded yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card" aria-labelledby="alerts-heading">
+  <h2 id="alerts-heading">Alert history</h2>
+  <div class="table-wrap">
+    <table class="stacked">
+      <thead>
+        <tr><th scope="col">Created</th><th scope="col">Type</th>
+            <th scope="col">Delivery</th><th scope="col">Detail</th></tr>
+      </thead>
+      <tbody>
+        {% for alert in alerts %}
+        <tr>
+          <td data-label="Created" class="num">{{ alert.created_at | dt }}</td>
+          <td data-label="Type">{{ alert_type_labels.get(alert.alert_type, alert.alert_type) }}</td>
+          <td data-label="Delivery">
+            <span class="badge badge-{{ alert_tone(alert.delivery_state) }}">
+              {{ delivery_state_labels.get(alert.delivery_state, alert.delivery_state) }}
+            </span>
+            {% if alert.attempts %}<span class="small muted" style="display:block">{{ alert.attempts }} attempt(s)</span>{% endif %}
+          </td>
+          <td data-label="Detail" class="detail-col small">
+            {{ alert.last_error or ('Delivered ' ~ (alert.delivered_at | dt)) }}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="muted small">No alerts yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% if config_versions|length > 1 %}
+<section class="card" aria-labelledby="series-heading">
+  <h2 id="series-heading">Configuration series</h2>
+  <p class="small muted">
+    Changing route, passengers, cabin, currency, markets or dates starts a new series.
+    Earlier observations are preserved but are not compared against the new configuration.
+  </p>
+  <div class="table-wrap">
+    <table class="stacked">
+      <thead><tr><th scope="col">Version</th><th scope="col">In effect from</th>
+                 <th scope="col">Until</th><th scope="col">Current</th></tr></thead>
+      <tbody>
+        {% for version in config_versions %}
+        <tr>
+          <td data-label="Version" class="num">v{{ version.version }}</td>
+          <td data-label="In effect from" class="num">{{ version.effective_from | dt }}</td>
+          <td data-label="Until" class="num">{{ version.effective_to | dt }}</td>
+          <td data-label="Current">
+            {% if version.id == t.current_config_version_id %}<span class="badge badge-ok">Current</span>{% else %}<span class="badge badge-muted">Closed</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+<dialog id="delete-dialog" aria-labelledby="delete-heading">
+  <h2 id="delete-heading">Delete “{{ t.name }}”?</h2>
+  <p>
+    This permanently deletes the tracker <strong>and all of its stored observations, search
+    runs and alert history</strong>. This cannot be undone.
+  </p>
+  <form method="post" action="/trackers/{{ t.id }}/delete">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="confirm_name">Type the tracker name to confirm</label>
+      <input type="text" id="confirm_name" name="confirm_name" autocomplete="off" required>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-danger" type="submit">Delete permanently</button>
+      <button class="btn" type="button" data-dialog-close>Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+{% endblock %}
