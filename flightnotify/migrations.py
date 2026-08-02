@@ -15,7 +15,7 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import Engine
 
-from .config import PROJECT_ROOT, Settings, get_settings
+from .config import PROJECT_ROOT, Settings, data_root, get_settings
 from .db import create_db_engine
 
 log = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ def alembic_config(settings: Settings | None = None, *, url: str | None = None) 
         tail = resolved.split("///", 1)[1]
         path = Path(tail)
         if not path.is_absolute():
-            resolved = f"sqlite:///{PROJECT_ROOT / path}"
+            resolved = f"sqlite:///{data_root() / path}"
     # `%` is Alembic's interpolation character; escape before handing it over.
     config.set_main_option("sqlalchemy.url", resolved.replace("%", "%%"))
     return config

@@ -23,7 +23,7 @@ from pathlib import Path
 from sqlalchemy import select
 
 from . import __version__, migrations
-from .config import PROJECT_ROOT, get_settings, reset_settings_cache
+from .config import PROJECT_ROOT, data_root, get_settings, reset_settings_cache
 from .db import DatabaseUnavailableError, get_session_factory, session_scope
 from .enums import DeliveryState, RunStatus, RunTrigger
 from .logging_setup import configure_logging
@@ -226,7 +226,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
         return EXIT_CONFIG
 
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    default_target = PROJECT_ROOT / "backups" / f"flightnotify-{stamp}.db"
+    default_target = data_root() / "backups" / f"flightnotify-{stamp}.db"
     target = Path(args.output) if args.output else default_target
     target.parent.mkdir(parents=True, exist_ok=True)
 

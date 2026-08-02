@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
-from .config import PROJECT_ROOT, Settings, get_settings
+from .config import Settings, data_root, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ class DatabaseUnavailableError(RuntimeError):
 
 
 def _normalize_url(settings: Settings) -> str:
-    """Resolve a relative SQLite path against the project root."""
+    """Resolve a relative SQLite path against the data root."""
     url = settings.database_url
     if not url.startswith("sqlite"):
         return url
@@ -33,7 +33,7 @@ def _normalize_url(settings: Settings) -> str:
         return url
     path = Path(tail)
     if not path.is_absolute():
-        path = PROJECT_ROOT / path
+        path = data_root() / path
     return f"{prefix}///{path}"
 
 

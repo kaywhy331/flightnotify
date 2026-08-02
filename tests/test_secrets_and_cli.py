@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from flightnotify import cli
+from flightnotify import cli, config
 from flightnotify.config import PROJECT_ROOT
 from flightnotify.enums import RunTrigger
 from flightnotify.logging_setup import RedactionFilter, configure_logging, redact, register_secret
@@ -245,3 +245,42 @@ def test_every_documented_command_is_registered(command):
     parser = cli.build_parser()
     action = next(a for a in parser._subparsers._group_actions if a.choices)
     assert command in action.choices
+
+
+def test_data_root_is_the_checkout_when_one_is_present():
+    """A source checkout keeps using the repository root, as it always has."""
+    assert (PROJECT_ROOT / "pyproject.toml").is_file(), "test assumes a source checkout"
+    assert config.data_root() == PROJECT_ROOT
+
+
+def test_data_root_falls_back_to_cwd_for_an_installed_package(tmp_path, monkeypatch):
+    """An installed wheel has no checkout, and must never store state in site-packages.
+
+    ``PROJECT_ROOT`` is ``site-packages`` there, so resolving relative paths
+    against it would write the database next to the installed code.
+    """
+    fake_site_packages = tmp_path / "site-packages"
+    fake_site_packages.mkdir()
+    monkeypatch.setattr(config, "PROJECT_ROOT", fake_site_packages)
+    monkeypatch.chdir(tmp_path)
+
+    assert config.data_root() == tmp_path
+    assert config.data_root() != fake_site_packages
+
+
+def test_relative_database_url_never_resolves_into_the_package(tmp_path, monkeypatch):
+    fake_site_packages = tmp_path / "site-packages"
+    fake_site_packages.mkdir()
+    monkeypatch.setattr(config, "PROJECT_ROOT", fake_site_packages)
+    monkeypatch.chdir(tmp_path)
+
+    settings = config.Settings(database_url="sqlite:///data/flightnotify.db", app_timezone="UTC")
+    resolved = settings.sqlite_path
+    assert resolved == tmp_path / "data" / "flightnotify.db"
+    assert fake_site_packages not in resolved.parents
+
+
+def test_absolute_database_url_is_left_alone(tmp_path):
+    """The container sets an absolute path; it must survive untouched."""
+    settings = config.Settings(database_url="sqlite:////data/flightnotify.db", app_timezone="UTC")
+    assert settings.sqlite_path == Path("/data/flightnotify.db")

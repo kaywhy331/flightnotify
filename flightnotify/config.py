@@ -19,6 +19,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def data_root() -> Path:
+    """Base directory for relative runtime paths: database, key, backups.
+
+    ``PROJECT_ROOT`` is the repository root only for a source checkout. For an
+    installed wheel it is ``site-packages``, which must never hold runtime
+    state. A checkout is identified by the ``pyproject.toml`` beside the
+    package - that file is build metadata and is never installed - so this
+    keeps the existing layout for a checkout and falls back to the working
+    directory, which is what a command line tool is expected to do.
+    """
+    if (PROJECT_ROOT / "pyproject.toml").is_file():
+        return PROJECT_ROOT
+    return Path.cwd()
+
+
 class PriceScope(StrEnum):
     """How a provider-reported price should be interpreted."""
 
@@ -121,7 +136,7 @@ class Settings(BaseSettings):
         if not tail or tail == ":memory:":
             return None
         path = Path(tail)
-        return path if path.is_absolute() else (PROJECT_ROOT / path)
+        return path if path.is_absolute() else (data_root() / path)
 
     def resolved_secret_key(self) -> str:
         """Return the signing key, generating and persisting one if needed.
@@ -134,7 +149,7 @@ class Settings(BaseSettings):
             return self.app_secret_key.strip()
 
         sqlite_path = self.sqlite_path
-        base = sqlite_path.parent if sqlite_path else (PROJECT_ROOT / "data")
+        base = sqlite_path.parent if sqlite_path else (data_root() / "data")
         base.mkdir(parents=True, exist_ok=True)
         key_file = base / "secret_key"
         if key_file.exists():

@@ -11,7 +11,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from flightnotify.config import PROJECT_ROOT, get_settings
+from flightnotify.config import data_root, get_settings
 from flightnotify.models import Base
 
 config = context.config
@@ -30,7 +30,7 @@ def _database_url() -> str:
         tail = url.split("///", 1)[1]
         path = Path(tail)
         if not path.is_absolute():
-            path = PROJECT_ROOT / path
+            path = data_root() / path
             url = f"sqlite:///{path}"
         # A clean checkout has no data/ directory yet; migrating must create it
         # rather than failing with "unable to open database file".
