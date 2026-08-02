@@ -29,6 +29,7 @@ from .enums import DeliveryState, RunStatus, RunTrigger
 from .logging_setup import configure_logging
 from .models import AlertEvent, SearchRun, Tracker
 from .providers.serpapi import SerpApiProvider
+from .services.bot import bot_health
 from .services.quota import QuotaManager
 from .services.scheduler import make_owner_id, run_due_trackers, scheduler_health
 from .services.settings_service import get_chat_id
@@ -344,6 +345,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  hourly         : {snapshot.hourly_used}/{snapshot.hourly_limit} in the last hour")
         running = "running" if health["running"] else "not running"
         print(f"  scheduler      : {running} - {health['detail']}")
+        bot = bot_health(session, settings)
+        bot_running = "running" if bot["running"] else "not running"
+        print(f"  telegram bot   : {bot_running} - {bot['detail']}")
         if snapshot.sync_error:
             print(f"  quota sync     : {snapshot.sync_error}")
     print(f"  checked at     : {format_local(utcnow(), settings.tzinfo)}")

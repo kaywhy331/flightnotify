@@ -77,6 +77,16 @@ class Settings(BaseSettings):
     log_format: str = "text"
 
     query_cache_ttl_seconds: int = 900
+
+    #: Answer Telegram commands as well as sending alerts. Off by default: it
+    #: is an inbound surface, and ``/check`` spends provider searches. Only the
+    #: configured chat id is ever obeyed.
+    bot_enabled: bool = False
+    #: Long-poll duration handed to getUpdates. Telegram holds the request open
+    #: for this long when there is nothing new, so it must stay below the
+    #: HTTP timeout used for the call.
+    bot_poll_timeout_seconds: int = 25
+
     scheduler_enabled: bool = True
     scheduler_tick_seconds: int = 60
     scheduler_lock_ttl_seconds: int = 300

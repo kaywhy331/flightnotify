@@ -20,7 +20,6 @@ from ..enums import (
     CoverageState,
     DateMode,
     DeliveryState,
-    FlexDuration,
     PriceScopeLabel,
     RunStatus,
     ThresholdBasis,
@@ -28,6 +27,8 @@ from ..enums import (
 )
 from ..models import AlertEvent, FareObservation, SearchRun, Tracker
 from ..services import tracker_service
+from ..services.bot import bot_health
+from ..services.messages import date_summary
 from ..services.quota import QuotaManager, QuotaSnapshot
 from ..services.scheduler import scheduler_health
 from ..services.settings_service import chat_id_source, get_chat_id
@@ -129,54 +130,13 @@ def telegram_view(session: Session, settings: Settings) -> dict[str, Any]:
     }
 
 
-def date_summary(tracker: Tracker) -> str:
-    mode = DateMode(tracker.date_mode)
-    if mode is DateMode.EXACT:
-        if tracker.outbound_date and tracker.return_date:
-            return f"{tracker.outbound_date:%b %-d, %Y} → {tracker.return_date:%b %-d, %Y}"
-        return "Dates not set"
-    if mode is DateMode.FLEXIBLE_PRESET:
-        month = tracker.flex_month
-        duration = tracker.flex_duration
-        month_name = (
-            [
-                "January",
-                "February",
-                "March",
-                "April",
-                "May",
-                "June",
-                "July",
-                "August",
-                "September",
-                "October",
-                "November",
-                "December",
-            ][month - 1]
-            if month and 1 <= month <= 12
-            else "Any month"
-        )
-        labels = {
-            FlexDuration.WEEKEND: "weekend",
-            FlexDuration.ONE_WEEK: "about 1 week",
-            FlexDuration.TWO_WEEKS: "about 2 weeks",
-        }
-        length = labels.get(FlexDuration(duration), "flexible") if duration else "flexible"
-        return f"{month_name}, {length} (provider picks the dates)"
-    parts = []
-    if tracker.window_outbound_start and tracker.window_outbound_end:
-        parts.append(
-            f"Depart {tracker.window_outbound_start:%b %-d} – {tracker.window_outbound_end:%b %-d}"
-        )
-    if tracker.window_return_start and tracker.window_return_end:
-        parts.append(
-            f"Return {tracker.window_return_start:%b %-d} – {tracker.window_return_end:%b %-d}"
-        )
-    if tracker.min_nights is not None or tracker.max_nights is not None:
-        lo = tracker.min_nights if tracker.min_nights is not None else "?"
-        hi = tracker.max_nights if tracker.max_nights is not None else "?"
-        parts.append(f"{lo}–{hi} nights")
-    return " · ".join(parts) or "Window not set"
+def bot_view(session: Session, settings: Settings) -> dict[str, Any]:
+    health = bot_health(session, settings)
+    return {
+        "enabled": settings.bot_enabled,
+        "running": bool(health["running"]),
+        "detail": str(health["detail"]),
+    }
 
 
 def status_badge(tracker: Tracker, stale: bool) -> tuple[str, str, str]:

@@ -42,6 +42,7 @@ def settings_page(request: Request, session: Session = Depends(db_session)) -> H
         quota=quota_manager.snapshot(session),
         telegram=viewmodels.telegram_view(session, settings),
         scheduler=scheduler_health(session, settings),
+        bot=viewmodels.bot_view(session, settings),
         setup=viewmodels.setup_state(session, settings),
         market_choices=MARKET_CHOICES,
         currency_choices=CURRENCY_CHOICES,

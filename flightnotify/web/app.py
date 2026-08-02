@@ -17,6 +17,7 @@ from .. import __version__, migrations
 from ..config import Settings, get_settings
 from ..db import DatabaseUnavailableError, get_session_factory
 from ..logging_setup import configure_logging
+from ..services.bot import BotPoller
 from ..services.scheduler import Scheduler
 from .deps import STATIC_DIR, base_context, build_templates
 from .routes import dashboard, settings_routes, trackers
@@ -50,9 +51,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             scheduler = Scheduler(get_session_factory(), settings)
             scheduler.start()
         app.state.scheduler = scheduler
+
+        # The command bot is opt-in and refuses to start without a chat id to
+        # authorise against; it logs the reason and leaves the app running.
+        bot: BotPoller | None = None
+        if settings.bot_enabled and startup_error is None:
+            bot = BotPoller(get_session_factory(), settings)
+            if not bot.start():
+                bot = None
+        app.state.bot = bot
+
         try:
             yield
         finally:
+            if bot is not None:
+                bot.stop()
             if scheduler is not None:
                 scheduler.stop()
 
@@ -123,6 +136,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "scheduler_running": bool(
                 getattr(app.state, "scheduler", None) and app.state.scheduler.running
             ),
+            "bot_running": bool(getattr(app.state, "bot", None) and app.state.bot.running),
         }
 
     return app

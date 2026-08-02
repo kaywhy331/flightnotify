@@ -471,7 +471,7 @@ class AppSetting(Base):
 
 
 class SchedulerState(Base):
-    """Singleton row holding the scheduler's single-instance lease."""
+    """Singleton row holding the background single-instance leases."""
 
     __tablename__ = "scheduler_state"
 
@@ -482,6 +482,13 @@ class SchedulerState(Base):
     last_tick_at: Mapped[datetime | None] = _utc_col()
     tick_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text)
+
+    # The Telegram command poller holds its own lease: Telegram rejects
+    # concurrent getUpdates calls with 409, and two pollers would each consume
+    # half the updates. Separate from the scheduler lease so either background
+    # worker can run without the other.
+    bot_lock_owner: Mapped[str | None] = mapped_column(String(80))
+    bot_lock_expires_at: Mapped[datetime | None] = _utc_col()
 
 
 __all__ = [

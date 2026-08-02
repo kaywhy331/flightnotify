@@ -20,11 +20,20 @@ KEY_DEFAULT_MARKET = "default_market"
 KEY_DEFAULT_CURRENCY = "default_currency"
 KEY_QUOTA_RESERVE = "quota_reserve_override"
 KEY_TIMEZONE_NOTE = "timezone_note"
+#: Highest Telegram update id already handled, so a restart never replays
+#: commands. Written by the bot poller, never by a form.
+KEY_BOT_UPDATE_OFFSET = "bot_update_offset"
 
 #: Keys the Settings screen is allowed to write. Anything else is rejected so a
 #: crafted form cannot inject arbitrary rows.
 WRITABLE_KEYS = frozenset(
-    {KEY_TELEGRAM_CHAT_ID, KEY_DEFAULT_MARKET, KEY_DEFAULT_CURRENCY, KEY_QUOTA_RESERVE}
+    {
+        KEY_TELEGRAM_CHAT_ID,
+        KEY_DEFAULT_MARKET,
+        KEY_DEFAULT_CURRENCY,
+        KEY_QUOTA_RESERVE,
+        KEY_BOT_UPDATE_OFFSET,
+    }
 )
 
 

@@ -103,6 +103,62 @@ def release_scheduler_lease(session: Session, owner: str) -> None:
     session.commit()
 
 
+def acquire_bot_lease(session: Session, owner: str, ttl_seconds: int) -> bool:
+    """Claim the single Telegram-poller lease.
+
+    Separate from the scheduler lease so either background worker can run
+    without the other. Telegram answers concurrent ``getUpdates`` calls with
+    409, and two pollers would each consume a share of the updates.
+    """
+    now = utcnow()
+    state = session.get(SchedulerState, 1)
+    if state is None:
+        state = SchedulerState(id=1)
+        session.add(state)
+        session.flush()
+
+    expires = ensure_utc(state.bot_lock_expires_at)
+    holder = state.bot_lock_owner
+    if holder and holder != owner and expires is not None and expires > now:
+        return False
+
+    result = session.execute(
+        update(SchedulerState)
+        .where(
+            SchedulerState.id == 1,
+            or_(
+                SchedulerState.bot_lock_owner.is_(None),
+                SchedulerState.bot_lock_owner == owner,
+                SchedulerState.bot_lock_expires_at.is_(None),
+                SchedulerState.bot_lock_expires_at < now,
+            ),
+        )
+        .values(bot_lock_owner=owner, bot_lock_expires_at=now + timedelta(seconds=ttl_seconds))
+    )
+    session.commit()
+    return _changed(result)
+
+
+def renew_bot_lease(session: Session, owner: str, ttl_seconds: int) -> bool:
+    now = utcnow()
+    result = session.execute(
+        update(SchedulerState)
+        .where(SchedulerState.id == 1, SchedulerState.bot_lock_owner == owner)
+        .values(bot_lock_expires_at=now + timedelta(seconds=ttl_seconds))
+    )
+    session.commit()
+    return _changed(result)
+
+
+def release_bot_lease(session: Session, owner: str) -> None:
+    session.execute(
+        update(SchedulerState)
+        .where(SchedulerState.id == 1, SchedulerState.bot_lock_owner == owner)
+        .values(bot_lock_owner=None, bot_lock_expires_at=None)
+    )
+    session.commit()
+
+
 def acquire_tracker_lock(session: Session, tracker_id: int, owner: str, ttl_seconds: int) -> bool:
     """Atomically claim a tracker. False means a check is already running."""
     now = utcnow()

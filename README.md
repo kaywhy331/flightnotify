@@ -22,6 +22,7 @@ sample fares.
 - [Quick start](#quick-start)
 - [Docker](#docker)
 - [Getting credentials](#getting-credentials)
+- [Telegram commands](#telegram-commands)
 - [Configuration](#configuration)
 - [How checks are scheduled](#how-checks-are-scheduled)
 - [The quota guard](#the-quota-guard)
@@ -151,6 +152,40 @@ Settings has a **Send test message** button to confirm delivery end to end.
 
 ---
 
+## Telegram commands
+
+The bot can answer commands as well as send alerts. It is **off by default** — set
+`BOT_ENABLED=true` and restart.
+
+| Command | What it does |
+|---|---|
+| `/status` | quota, scheduler and setup state |
+| `/trackers` | every tracker with its latest observed fare |
+| `/tracker <id>` | detail for one tracker: observed low, threshold, coverage |
+| `/check <id>` | check one tracker now — **spends provider searches** |
+| `/pause <id>` | stop checking a tracker (history is kept) |
+| `/resume <id>` | resume a paused tracker |
+| `/help` | the list above |
+
+Creating and deleting trackers stays in the web UI: those need the full form and its quota
+estimate.
+
+`/check` runs with the same trigger as the UI's "Check now", so it may draw on the reserve that
+automation cannot touch — that is the point of the reserve.
+
+### Two things to know
+
+**Only the configured chat is obeyed.** Every other chat is ignored with no reply, so a stranger
+who finds your bot gets silence. The poller refuses to start if no chat id is connected, since
+there would be nothing to authorise against. Anyone who *does* have access to your chat can spend
+your provider quota with `/check` — the bot is exactly as trusted as that chat.
+
+**Enabling the bot disables "Discover chat".** Telegram delivers each update to a single reader;
+once the poller is consuming them, the Settings discovery button finds nothing. Connect your chat
+first, or set `BOT_ENABLED=false` and restart to discover again.
+
+---
+
 ## Configuration
 
 All settings are read from the environment or `.env`. Secrets are never written to the database,
@@ -165,6 +200,8 @@ rendered into templates, or logged — the logger redacts them by literal value.
 | `SERPAPI_PRICE_SCOPE` | `party_total` | How to read the provider's `price` field. See below. |
 | `TELEGRAM_BOT_TOKEN` | *(empty)* | Bot token from @BotFather. |
 | `TELEGRAM_CHAT_ID` | *(empty)* | Destination chat; discoverable from the UI. |
+| `BOT_ENABLED` | `false` | Answer Telegram commands. See [Telegram commands](#telegram-commands). |
+| `BOT_POLL_TIMEOUT_SECONDS` | `25` | How long Telegram holds a quiet poll open. |
 | `APP_TIMEZONE` | `America/Los_Angeles` | IANA zone for schedules and displayed times. |
 | `APP_HOST` / `APP_PORT` | `127.0.0.1` / `8000` | Listen address. |
 | `APP_SECRET_KEY` | *(generated)* | Signs session cookies and CSRF tokens. |

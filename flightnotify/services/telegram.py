@@ -176,6 +176,29 @@ class TelegramNotifier:
             )
         return chats, TelegramResult(ok=True, category="ok", user_message="")
 
+    def get_updates(self, *, offset: int | None = None, timeout: int = 0) -> TelegramResult:
+        """Fetch pending updates, optionally long-polling.
+
+        ``offset`` must be one past the highest update id already handled;
+        supplying it is what tells Telegram to forget the earlier ones. A
+        non-zero ``timeout`` asks Telegram to hold the request open until an
+        update arrives, which is far cheaper than polling in a tight loop.
+
+        ``getUpdates`` is single-consumer: confirming an offset discards older
+        updates, so nothing else (notably :meth:`discover_chats`) can read them
+        afterwards.
+        """
+        payload: dict[str, Any] = {
+            "timeout": max(0, timeout),
+            "allowed_updates": '["message"]',
+        }
+        if offset is not None:
+            payload["offset"] = offset
+        # The HTTP call must outlive the long poll itself, or every quiet poll
+        # would surface as a timeout.
+        http_timeout = self._settings.telegram_timeout_seconds + timeout
+        return self._call("getUpdates", payload, timeout=http_timeout)
+
     def send_message(
         self, chat_id: str | int, text: str, *, disable_preview: bool = False
     ) -> TelegramResult:
@@ -200,7 +223,9 @@ class TelegramNotifier:
         return result
 
     # -- transport ----------------------------------------------------------
-    def _call(self, method: str, payload: dict[str, Any]) -> TelegramResult:
+    def _call(
+        self, method: str, payload: dict[str, Any], *, timeout: float | None = None
+    ) -> TelegramResult:
         token = self._settings.telegram_bot_token.strip()
         if not token:
             return TelegramResult(
@@ -215,7 +240,8 @@ class TelegramNotifier:
         url = f"{self._settings.telegram_base_url.rstrip('/')}/bot{token}/{method}"
         try:
             with httpx.Client(
-                timeout=self._settings.telegram_timeout_seconds, transport=self._transport
+                timeout=timeout if timeout is not None else self._settings.telegram_timeout_seconds,
+                transport=self._transport,
             ) as client:
                 response = client.post(url, data=payload)
         except httpx.TimeoutException:

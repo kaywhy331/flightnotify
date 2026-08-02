@@ -114,6 +114,13 @@
     Discovery reads recent direct messages sent to your bot. Telegram keeps them for 24 hours
     and this does not work while the bot has a webhook configured.
   </p>
+  {% if bot.enabled %}
+  <p class="small muted">
+    <strong>The command bot is enabled.</strong> Telegram delivers each message to only one
+    reader, so the bot consumes the updates discovery would need and this button will find
+    nothing. Set <code>BOT_ENABLED=false</code> and restart to discover a chat again.
+  </p>
+  {% endif %}
 
   {% if discovered %}
   <h3>Choose a chat</h3>
