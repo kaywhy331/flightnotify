@@ -120,12 +120,37 @@ class AccountStatus:
 
 @runtime_checkable
 class FareProvider(Protocol):
-    """The contract the tracking domain depends on."""
+    """The contract the tracking domain depends on.
+
+    This is everything :class:`~flightnotify.services.search.SearchService`
+    actually calls. The request-shaping and parsing members are part of the
+    contract, not implementation detail: the cache stores a provider's own
+    request parameters as the fingerprint and replays its own payloads, so a
+    provider must be able to build and read both.
+    """
 
     name: str
 
     def is_configured(self) -> bool:
         """True when credentials are present. Never returns the credential."""
+
+    @property
+    def price_scope(self) -> PriceScopeLabel:
+        """How this provider's prices should be read (party total vs each)."""
+
+    @property
+    def exact_endpoint(self) -> EndpointType:
+        """Endpoint recorded for a fixed-date search."""
+
+    @property
+    def flexible_endpoint(self) -> EndpointType:
+        """Endpoint recorded for a flexible search."""
+
+    def build_exact_params(self, query: ExactSearchQuery) -> dict[str, Any]:
+        """Credential-free request parameters, used as the cache fingerprint."""
+
+    def build_flexible_params(self, query: FlexibleSearchQuery) -> dict[str, Any]:
+        """Credential-free request parameters, used as the cache fingerprint."""
 
     def search_exact(self, query: ExactSearchQuery) -> ProviderResult:
         """Run a fixed-date round-trip search."""
@@ -135,6 +160,23 @@ class FareProvider(Protocol):
 
     def search_flexible(self, query: FlexibleSearchQuery) -> ProviderResult:
         """Run a route-specific flexible search."""
+
+    def parse_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        flexible: bool,
+        market: str,
+        currency: str,
+        query_fingerprint: str,
+        outbound_date: date | None = None,
+        return_date: date | None = None,
+    ) -> ProviderResult:
+        """Read a stored response body back into a result.
+
+        Used to replay a cached payload without spending a search, so it must
+        accept exactly what this provider's own search methods produced.
+        """
 
     def account_status(self) -> AccountStatus:
         """Fetch provider-reported quota. Must not consume a fare search."""

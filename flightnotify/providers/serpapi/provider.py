@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
@@ -79,6 +79,45 @@ class SerpApiProvider:
     @property
     def price_scope(self) -> PriceScopeLabel:
         return self._price_scope
+
+    @property
+    def exact_endpoint(self) -> EndpointType:
+        return EndpointType.GOOGLE_FLIGHTS
+
+    @property
+    def flexible_endpoint(self) -> EndpointType:
+        return EndpointType.GOOGLE_TRAVEL_EXPLORE
+
+    # -- cache replay -------------------------------------------------------
+    def parse_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        flexible: bool,
+        market: str,
+        currency: str,
+        query_fingerprint: str,
+        outbound_date: date | None = None,
+        return_date: date | None = None,
+    ) -> ProviderResult:
+        """Read a stored SerpApi body back into a result, spending nothing."""
+        if flexible:
+            return parse_google_travel_explore(
+                payload,
+                market=market,
+                currency=currency,
+                query_fingerprint=query_fingerprint,
+                price_scope=self._price_scope,
+            )
+        return parse_google_flights(
+            payload,
+            market=market,
+            currency=currency,
+            query_fingerprint=query_fingerprint,
+            price_scope=self._price_scope,
+            outbound_date=outbound_date,
+            return_date=return_date,
+        )
 
     # -- searches -----------------------------------------------------------
     def build_exact_params(self, query: ExactSearchQuery) -> dict[str, Any]:

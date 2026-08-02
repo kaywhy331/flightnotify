@@ -48,17 +48,14 @@ from ..enums import (
 from ..models import AppSetting, FareObservation, FlexibleDateCandidate, SearchRun, Tracker
 from ..providers.base import (
     ExactSearchQuery,
+    FareProvider,
     FlexibleSearchQuery,
     NormalizedOffer,
     PassengerParty,
     ProviderResult,
 )
 from ..providers.errors import ProviderError, ProviderMissingCredentialsError
-from ..providers.serpapi.parsing import (
-    parse_google_flights,
-    parse_google_travel_explore,
-)
-from ..providers.serpapi.provider import SerpApiProvider
+from ..providers.factory import get_provider
 from ..timeutil import ensure_utc, today_in, utcnow
 from . import tracker_service
 from .alerts import AlertOutcome, AlertService, CoverageInfo
@@ -124,13 +121,13 @@ class SearchService:
         self,
         settings: Settings | None = None,
         *,
-        provider: SerpApiProvider | None = None,
+        provider: FareProvider | None = None,
         quota: QuotaManager | None = None,
         cache: QueryCache | None = None,
         alerts: AlertService | None = None,
     ) -> None:
         self.settings = settings or get_settings()
-        self.provider = provider or SerpApiProvider(self.settings)
+        self.provider = provider or get_provider(self.settings)
         self.quota = quota or QuotaManager(self.settings)
         self.cache = cache or QueryCache(self.settings.query_cache_ttl_seconds)
         self.alerts = alerts or AlertService(self.settings)
@@ -452,21 +449,14 @@ class SearchService:
     def _parse_cached(
         self, unit: QueryUnit, payload: dict[str, Any], tracker: Tracker
     ) -> ProviderResult:
-        scope = self.provider.price_scope
-        if unit.endpoint is EndpointType.GOOGLE_TRAVEL_EXPLORE:
-            return parse_google_travel_explore(
-                payload,
-                market=unit.market,
-                currency=tracker.currency,
-                query_fingerprint=unit.fingerprint,
-                price_scope=scope,
-            )
-        return parse_google_flights(
+        # The provider that produced the payload is the only thing that can
+        # read it back, so the dispatch belongs there rather than here.
+        return self.provider.parse_payload(
             payload,
+            flexible=unit.flexible_query is not None,
             market=unit.market,
             currency=tracker.currency,
             query_fingerprint=unit.fingerprint,
-            price_scope=scope,
             outbound_date=unit.outbound_date,
             return_date=unit.return_date,
         )
@@ -488,8 +478,7 @@ class SearchService:
         session.flush()
 
         try:
-            if unit.endpoint is EndpointType.GOOGLE_TRAVEL_EXPLORE:
-                assert unit.flexible_query is not None
+            if unit.flexible_query is not None:
                 provider_result = self.provider.search_flexible(unit.flexible_query)
             else:
                 assert unit.exact_query is not None

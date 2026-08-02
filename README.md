@@ -22,6 +22,7 @@ sample fares.
 - [Quick start](#quick-start)
 - [Docker](#docker)
 - [Getting credentials](#getting-credentials)
+- [Fare providers](#fare-providers)
 - [Telegram commands](#telegram-commands)
 - [Configuration](#configuration)
 - [How checks are scheduled](#how-checks-are-scheduled)
@@ -152,6 +153,36 @@ Settings has a **Send test message** button to confirm delivery end to end.
 
 ---
 
+## Fare providers
+
+FlightNotify talks to one fare provider at a time, chosen with `FLIGHT_PROVIDER`. Both implement
+the same `FareProvider` contract (`flightnotify/providers/base.py`), so tracking, alerting and
+quota accounting are unchanged by the choice.
+
+| | **`serpapi`** (default) | **`amadeus`** |
+|---|---|---|
+| Data | Google Flights, scraped via SerpApi | Airline/GDS fares, Amadeus Self-Service |
+| Route coverage | Broad | Narrower |
+| Free allowance | 250 searches/month | See your Amadeus app's plan |
+| Flexible window | 1 search **per date pair** | 1 request for the **whole date range** |
+| Price basis | Not documented — see `SERPAPI_PRICE_SCOPE` | Documented as the party total |
+| Stop filters | Any / nonstop / ≤1 stop | Any / nonstop only |
+
+The flexible-window row is the important one. An 18-combination window costs 18 SerpApi searches
+but a single Amadeus Cheapest Date Search request, because Amadeus accepts a departure-date range
+directly.
+
+Amadeus needs an app at <https://developers.amadeus.com/my-apps>, which gives a client id and
+secret (OAuth2, exchanged for a short-lived token that FlightNotify caches and reuses).
+
+> **Status: unverified against the live API.** The Amadeus adapter is built from Amadeus's
+> published OpenAPI specification and is covered by tests using fixtures derived from that spec —
+> no Amadeus account was available to record real responses. It should be treated as a working
+> prototype until a real call confirms it. The `test` environment also serves a limited cached
+> data set, so an empty result there usually means "no data for this route", not a fault.
+
+---
+
 ## Telegram commands
 
 The bot can answer commands as well as send alerts. It is **off by default** — set
@@ -193,6 +224,9 @@ rendered into templates, or logged — the logger redacts them by literal value.
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `FLIGHT_PROVIDER` | `serpapi` | Which fare provider to use. See [Fare providers](#fare-providers). |
+| `AMADEUS_CLIENT_ID` / `AMADEUS_CLIENT_SECRET` | *(empty)* | Only for `FLIGHT_PROVIDER=amadeus`. |
+| `AMADEUS_ENVIRONMENT` | `test` | `test` serves limited cached data; `production` is live. |
 | `SERPAPI_API_KEY` | *(empty)* | Provider key. Without it, no search is attempted. |
 | `SERPAPI_MONTHLY_SEARCH_LIMIT` | `250` | Monthly cap the guard enforces. |
 | `SERPAPI_HOURLY_SEARCH_LIMIT` | `50` | Hourly cap the guard enforces. |
@@ -447,7 +481,8 @@ are pure functions, which is why they carry the densest test coverage.
 
 ## Limitations
 
-- **One provider.** SerpApi's Google Flights endpoints only.
+- **One provider at a time.** SerpApi (Google Flights) or Amadeus; see
+  [Fare providers](#fare-providers). The Amadeus adapter is not yet verified against the live API.
 - **Round trips only.** No one-way or multi-city.
 - **Single user, no auth.** By design; see [Security](#security).
 - **Observed history only.** The low is what this installation has seen, not a market low.

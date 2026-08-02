@@ -54,6 +54,10 @@ class RunTrigger(StrEnum):
 class EndpointType(StrEnum):
     GOOGLE_FLIGHTS = "google_flights"
     GOOGLE_TRAVEL_EXPLORE = "google_travel_explore"
+    #: Amadeus Flight Offers Search - one fixed outbound/return pair.
+    AMADEUS_FLIGHT_OFFERS = "amadeus_flight_offers"
+    #: Amadeus Flight Cheapest Date Search - a date range in one call.
+    AMADEUS_FLIGHT_DATES = "amadeus_flight_dates"
 
 
 class RunStatus(StrEnum):

@@ -1,0 +1,43 @@
+{
+  "_fixture_note": "Constructed from the official Amadeus OpenAPI specification (amadeus4dev/amadeus-open-api-specification, FlightCheapestDateSearch_v1). NOT captured from a live account. Field names and types follow the spec; values are illustrative.",
+  "meta": {
+    "currency": "USD",
+    "count": 3,
+    "defaults": {"departureDate": "2026-11-14,2026-11-18", "oneWay": false, "duration": "14"}
+  },
+  "data": [
+    {
+      "type": "flight-date",
+      "origin": "SFO",
+      "destination": "NRT",
+      "departureDate": "2026-11-14",
+      "returnDate": "2026-11-25",
+      "price": {"total": "1059.60"},
+      "links": {"flightOffers": "https://test.api.amadeus.com/v2/shopping/flight-offers?originLocationCode=SFO"}
+    },
+    {
+      "type": "flight-date",
+      "origin": "SFO",
+      "destination": "NRT",
+      "departureDate": "2026-11-15",
+      "returnDate": "2026-11-26",
+      "price": {"total": "912.30"},
+      "links": {"flightOffers": "https://test.api.amadeus.com/v2/shopping/flight-offers?originLocationCode=SFO"}
+    },
+    {
+      "type": "flight-date",
+      "origin": "SFO",
+      "destination": "NRT",
+      "departureDate": "2026-11-17",
+      "returnDate": "2026-11-28",
+      "price": {"total": "1340.00"}
+    }
+  ],
+  "dictionaries": {
+    "currencies": {"USD": "US DOLLAR"},
+    "locations": {
+      "SFO": {"subType": "AIRPORT", "detailedName": "SAN FRANCISCO INTL"},
+      "NRT": {"subType": "AIRPORT", "detailedName": "NARITA INTL"}
+    }
+  }
+}

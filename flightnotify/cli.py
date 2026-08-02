@@ -28,7 +28,7 @@ from .db import DatabaseUnavailableError, get_session_factory, session_scope
 from .enums import DeliveryState, RunStatus, RunTrigger
 from .logging_setup import configure_logging
 from .models import AlertEvent, SearchRun, Tracker
-from .providers.serpapi import SerpApiProvider
+from .providers.factory import get_provider
 from .services.bot import bot_health
 from .services.quota import QuotaManager
 from .services.scheduler import make_owner_id, run_due_trackers, scheduler_health
@@ -329,7 +329,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     with session_scope() as session:
         manager = QuotaManager(settings)
         if args.sync and settings.has_provider_credentials:
-            manager.sync_from_provider(session, SerpApiProvider(settings))
+            manager.sync_from_provider(session, get_provider(settings))
         snapshot = manager.snapshot(session)
         health = scheduler_health(session, settings)
         tracker_count = len(session.execute(select(Tracker.id)).scalars().all())

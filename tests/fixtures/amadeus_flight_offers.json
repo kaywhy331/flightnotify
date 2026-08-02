@@ -1,0 +1,135 @@
+{
+  "_fixture_note": "Constructed from the official Amadeus OpenAPI specification (amadeus4dev/amadeus-open-api-specification, FlightOffersSearch_v2). NOT captured from a live account - no Amadeus credentials were available. Field names and types follow the spec; values are illustrative.",
+  "meta": {
+    "count": 2,
+    "links": {
+      "self": "https://test.api.amadeus.com/v2/shopping/flight-offers"
+    }
+  },
+  "data": [
+    {
+      "type": "flight-offer",
+      "id": "1",
+      "source": "GDS",
+      "numberOfBookableSeats": 4,
+      "itineraries": [
+        {
+          "duration": "PT11H30M",
+          "segments": [
+            {
+              "departure": {"iataCode": "SFO", "at": "2026-11-14T11:05:00"},
+              "arrival": {"iataCode": "NRT", "at": "2026-11-15T14:35:00"},
+              "carrierCode": "NH",
+              "number": "7",
+              "duration": "PT11H30M",
+              "numberOfStops": 0
+            }
+          ]
+        },
+        {
+          "duration": "PT9H45M",
+          "segments": [
+            {
+              "departure": {"iataCode": "NRT", "at": "2026-11-25T17:00:00"},
+              "arrival": {"iataCode": "SFO", "at": "2026-11-25T09:45:00"},
+              "carrierCode": "NH",
+              "number": "8",
+              "duration": "PT9H45M",
+              "numberOfStops": 0
+            }
+          ]
+        }
+      ],
+      "price": {
+        "currency": "USD",
+        "total": "1180.40",
+        "base": "902.00",
+        "grandTotal": "1180.40"
+      },
+      "validatingAirlineCodes": ["NH"],
+      "travelerPricings": [
+        {
+          "travelerId": "1",
+          "fareOption": "STANDARD",
+          "travelerType": "ADULT",
+          "price": {"currency": "USD", "total": "590.20", "base": "451.00"},
+          "fareDetailsBySegment": [
+            {"segmentId": "1", "cabin": "ECONOMY", "class": "N"}
+          ]
+        },
+        {
+          "travelerId": "2",
+          "fareOption": "STANDARD",
+          "travelerType": "ADULT",
+          "price": {"currency": "USD", "total": "590.20", "base": "451.00"},
+          "fareDetailsBySegment": [
+            {"segmentId": "1", "cabin": "ECONOMY", "class": "N"}
+          ]
+        }
+      ]
+    },
+    {
+      "type": "flight-offer",
+      "id": "2",
+      "source": "GDS",
+      "itineraries": [
+        {
+          "duration": "PT16H20M",
+          "segments": [
+            {
+              "departure": {"iataCode": "SFO", "at": "2026-11-14T07:15:00"},
+              "arrival": {"iataCode": "ICN", "at": "2026-11-15T11:40:00"},
+              "carrierCode": "KE",
+              "number": "24",
+              "duration": "PT12H25M"
+            },
+            {
+              "departure": {"iataCode": "ICN", "at": "2026-11-15T13:20:00"},
+              "arrival": {"iataCode": "NRT", "at": "2026-11-15T15:35:00"},
+              "carrierCode": "KE",
+              "number": "703",
+              "duration": "PT2H15M"
+            }
+          ]
+        },
+        {
+          "duration": "PT13H05M",
+          "segments": [
+            {
+              "departure": {"iataCode": "NRT", "at": "2026-11-25T10:00:00"},
+              "arrival": {"iataCode": "SFO", "at": "2026-11-25T08:05:00"},
+              "carrierCode": "KE",
+              "number": "704",
+              "duration": "PT13H05M"
+            }
+          ]
+        }
+      ],
+      "price": {
+        "currency": "USD",
+        "total": "988.00",
+        "base": "740.00",
+        "grandTotal": "988.00"
+      },
+      "validatingAirlineCodes": ["KE"],
+      "travelerPricings": [
+        {
+          "travelerId": "1",
+          "fareOption": "STANDARD",
+          "travelerType": "ADULT",
+          "price": {"currency": "USD", "total": "494.00"},
+          "fareDetailsBySegment": [
+            {"segmentId": "1", "cabin": "ECONOMY", "class": "T"}
+          ]
+        }
+      ]
+    }
+  ],
+  "dictionaries": {
+    "carriers": {
+      "NH": "ALL NIPPON AIRWAYS",
+      "KE": "KOREAN AIR"
+    },
+    "currencies": {"USD": "US DOLLAR"}
+  }
+}

@@ -34,6 +34,13 @@ def data_root() -> Path:
     return Path.cwd()
 
 
+class FlightProvider(StrEnum):
+    """Which adapter answers fare searches."""
+
+    SERPAPI = "serpapi"
+    AMADEUS = "amadeus"
+
+
 class PriceScope(StrEnum):
     """How a provider-reported price should be interpreted."""
 
@@ -58,6 +65,16 @@ class Settings(BaseSettings):
     serpapi_reserve_searches: int = 10
     serpapi_price_scope: PriceScope = PriceScope.PARTY_TOTAL
     serpapi_timeout_seconds: float = 60.0
+
+    # --- amadeus (alternative fare provider) --------------------------------
+    #: Which provider answers fare searches. "serpapi" scrapes Google Flights
+    #: via SerpApi; "amadeus" uses airline/GDS data from Amadeus Self-Service.
+    flight_provider: FlightProvider = FlightProvider.SERPAPI
+    amadeus_client_id: str = ""
+    amadeus_client_secret: str = ""
+    #: "test" serves a limited cached data set; "production" is live.
+    amadeus_environment: str = "test"
+    amadeus_timeout_seconds: float = 30.0
 
     # --- telegram -----------------------------------------------------------
     telegram_bot_token: str = ""
@@ -130,7 +147,17 @@ class Settings(BaseSettings):
 
     @property
     def has_provider_credentials(self) -> bool:
+        """Whether the *selected* provider has what it needs to search."""
+        if FlightProvider(self.flight_provider) is FlightProvider.AMADEUS:
+            return bool(self.amadeus_client_id.strip() and self.amadeus_client_secret.strip())
         return bool(self.serpapi_api_key.strip())
+
+    @property
+    def provider_credential_hint(self) -> str:
+        """Which variables to set, named for the selected provider."""
+        if FlightProvider(self.flight_provider) is FlightProvider.AMADEUS:
+            return "AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET"
+        return "SERPAPI_API_KEY"
 
     @property
     def has_telegram_token(self) -> bool:

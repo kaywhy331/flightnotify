@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from ...config import get_settings
 from ...db import db_session
 from ...forms import CURRENCY_CHOICES, MARKET_CHOICES
-from ...providers.serpapi import SerpApiProvider
+from ...providers.factory import get_provider
 from ...services.messages import build_test_message
 from ...services.quota import QuotaManager
 from ...services.scheduler import scheduler_health
@@ -67,7 +67,7 @@ def refresh_quota(request: Request, session: Session = Depends(db_session)) -> R
         )
         return RedirectResponse("/settings", status_code=303)
     manager = QuotaManager(settings)
-    snapshot = manager.sync_from_provider(session, SerpApiProvider(settings))
+    snapshot = manager.sync_from_provider(session, get_provider(settings))
     session.commit()
     if snapshot.sync_error:
         flash(request, snapshot.sync_error, "danger")
