@@ -39,12 +39,20 @@ flightnotify = "flightnotify.cli:main"
 include = ["flightnotify*"]
 
 [tool.setuptools.package-data]
-flightnotify = ["web/templates/**/*.html", "web/static/**/*"]
+# The migration scripts are package data, not importable modules: they ship
+# inside the package so a wheel install can migrate its own database.
+flightnotify = [
+  "web/templates/**/*.html",
+  "web/static/**/*",
+  "alembic/env.py",
+  "alembic/script.py.mako",
+  "alembic/versions/*.py",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["alembic/versions"]
+extend-exclude = ["flightnotify/alembic/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]

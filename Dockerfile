@@ -15,8 +15,8 @@ COPY pyproject.toml README.md ./
 COPY flightnotify/__init__.py flightnotify/__init__.py
 RUN pip install --no-cache-dir .
 
-COPY alembic.ini ./
-COPY alembic ./alembic
+# The migration scripts ship inside the package (see pyproject package-data),
+# so installing the package is enough - nothing extra to copy for Alembic.
 COPY flightnotify ./flightnotify
 RUN pip install --no-cache-dir --no-deps .
 

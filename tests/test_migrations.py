@@ -111,3 +111,44 @@ def test_unique_constraints_are_enforced_after_migration(fresh_settings):
 
 def test_head_revision_is_resolvable(fresh_settings):
     assert migrations.head_revision(fresh_settings)
+
+
+def test_migrations_are_packaged_inside_the_package(fresh_settings):
+    """The scripts must be found by package layout, not by project root.
+
+    Resolving them against the project root works for an editable install and
+    silently resolves to ``site-packages/alembic`` - the Alembic *library* -
+    for a wheel install, which left the database unmigrated.
+    """
+    import flightnotify
+
+    package_dir = Path(flightnotify.__file__).resolve().parent
+    assert package_dir / "alembic" == migrations.ALEMBIC_DIR
+    assert (migrations.ALEMBIC_DIR / "env.py").is_file()
+    assert list(migrations.ALEMBIC_DIR.glob("versions/*.py")), "no migration scripts packaged"
+
+
+def test_unresolvable_migrations_raise_instead_of_reporting_up_to_date(
+    fresh_settings, monkeypatch, tmp_path
+):
+    """An empty database plus missing scripts must never look 'up to date'.
+
+    ``current_revision`` is ``None`` for an empty database. If ``head_revision``
+    also returned ``None`` the two compared equal, ``ensure_schema`` skipped the
+    migration, and the app crashed later on a missing table.
+    """
+    monkeypatch.setattr(migrations, "ALEMBIC_DIR", tmp_path / "not-migrations")
+
+    with pytest.raises(migrations.MigrationsUnavailableError):
+        migrations.head_revision(fresh_settings)
+
+    with pytest.raises(migrations.MigrationsUnavailableError):
+        migrations.ensure_schema(fresh_settings)
+
+    # Connecting creates an empty SQLite file; what must not happen is a
+    # half-built or silently-skipped schema.
+    engine = create_engine(fresh_settings.database_url)
+    try:
+        assert not set(inspect(engine).get_table_names()) & EXPECTED_TABLES
+    finally:
+        engine.dispose()

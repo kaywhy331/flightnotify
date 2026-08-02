@@ -391,10 +391,17 @@ flightnotify/
   providers/serpapi/  provider client and response parsing
   services/           search orchestration, quota, cache, scheduler, alerts, telegram
   web/                FastAPI app, routes, templates, static assets
-alembic/              migrations
+  alembic/            migrations (shipped inside the package)
+alembic.ini           config for running the `alembic` CLI from a checkout
 tests/                offline suite + fixtures
 tests/live/           opt-in live checks
 ```
+
+Migrations live **inside** the package rather than at the repository root. Resolving them
+against the project root only works for an editable install; for a wheel install it resolves to
+`site-packages/alembic` — the Alembic library itself — which left the database unmigrated.
+Packaging them means `flightnotify migrate` behaves identically from a checkout, a wheel, or the
+container image.
 
 The `domain/` package holds no I/O — pricing normalization, date expansion, and alert evaluation
 are pure functions, which is why they carry the densest test coverage.
