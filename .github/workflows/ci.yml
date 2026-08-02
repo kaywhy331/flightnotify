@@ -61,7 +61,17 @@ jobs:
         run: pytest --cov=flightnotify --cov-report=term-missing
 
       - name: Live tests stay skipped without opt-in
-        run: pytest tests/live -q -rs | tee /dev/stderr | grep -q "skipped"
+        # No extra -q here: pytest's addopts already sets it, and -qq would
+        # suppress the "N skipped" summary this check reads.
+        run: |
+          pytest tests/live -rs | tee live-tests.log
+          grep -qi "skipped" live-tests.log
+          # A passed/failed count means a live test actually executed, which
+          # would mean real provider or Telegram calls without opt-in.
+          if grep -qiE "[0-9]+ (passed|failed)" live-tests.log; then
+            echo "::error::live tests executed without FLIGHTNOTIFY_LIVE_TESTS opt-in"
+            exit 1
+          fi
 
       - name: Application starts in the setup-required state
         run: |
