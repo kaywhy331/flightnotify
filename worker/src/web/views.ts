@@ -11,6 +11,7 @@ import type {
   AlertEventRow,
   CronRunRow,
   FareObservationRow,
+  FlexibleDateCandidateRow,
   SearchRunRow,
   TrackerWithMarkets,
 } from "../db/rows.js";
@@ -25,11 +26,12 @@ import {
   TrackerStatus,
 } from "../domain/enums.js";
 import { formatMoney } from "../domain/money.js";
-import { formatDateShort, formatLocal, humanizeDelta } from "../time.js";
+import { formatDateShort, formatLocal, humanizeDelta, parseIsoOrNull } from "../time.js";
 import type { QuotaSnapshot } from "../services/quota.js";
 import { humanizeDuration, SCHEDULE_CHOICES } from "../services/planner.js";
 import type { FormBudget } from "./tracker-form.js";
 import { html, raw, type SafeHtml } from "./html.js";
+import { renderAirportDatalist } from "./airports.js";
 
 export interface OperationalStatus {
   environment: string;
@@ -62,7 +64,50 @@ function badge(ok: boolean, okText: string, badText: string): SafeHtml {
 function statusBadge(status: string): SafeHtml {
   if (status === TrackerStatus.ACTIVE) return html`<span class="badge badge-ok">Active</span>`;
   if (status === TrackerStatus.PAUSED) return html`<span class="badge badge-muted">Paused</span>`;
+  if (status === TrackerStatus.COMPLETED)
+    return html`<span class="badge badge-info">Completed</span>`;
   return html`<span class="badge badge-danger">Error</span>`;
+}
+
+/** External links come from provider payloads; render only plain https. */
+function safeHttpsLink(url: string | null | undefined): string | null {
+  if (!url) return null;
+  return /^https:\/\//i.test(url.trim()) ? url.trim() : null;
+}
+
+/**
+ * Tiny inline trend line for the tracker list. Geometry only -- the numbers
+ * are in the adjacent cells, so the sparkline carries no information colour
+ * alone would.
+ */
+function sparkline(series: { at: string; cents: number }[] | undefined): SafeHtml {
+  const points = (series ?? []).slice(-16);
+  if (points.length < 2) return html`<span class="muted small">–</span>`;
+  const lo = Math.min(...points.map((p) => p.cents));
+  const hi = Math.max(...points.map((p) => p.cents));
+  const span = hi === lo ? 1 : hi - lo;
+  const coords = points
+    .map((point, index) => {
+      const x = 2 + (86 * index) / (points.length - 1);
+      const y = 20 - (16 * (point.cents - lo)) / span;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  const falling = points[points.length - 1]!.cents <= points[0]!.cents;
+  return raw(
+    `<svg class="sparkline" width="90" height="24" viewBox="0 0 90 24" aria-hidden="true">` +
+      `<polyline points="${coords}" fill="none" stroke="${falling ? "#1a7f37" : "#9a6700"}" ` +
+      `stroke-width="1.5" /></svg>`,
+  );
+}
+
+/** A check is overdue once it is a full interval past its scheduled time. */
+function isOverdue(t: TrackerWithMarkets, now = new Date()): boolean {
+  if (t.status !== TrackerStatus.ACTIVE || t.next_run_at === null) return false;
+  const due = parseIsoOrNull(t.next_run_at);
+  if (due === null) return false;
+  const graceMs = Math.max(t.check_interval_minutes, 15) * 60_000;
+  return now.getTime() - due.getTime() > graceMs;
 }
 
 function csrfField(token: string): SafeHtml {
@@ -128,9 +173,21 @@ export function dashboardPage(args: {
   trackers: TrackerWithMarkets[];
   recentAlerts: AlertEventRow[];
   tz: string;
+  sparklines?: Map<number, { at: string; cents: number }[]>;
 }): SafeHtml {
   const { status, trackers, tz } = args;
   const q = status.quota;
+
+  // One line the traveler can skim past; the machinery hides behind it. A
+  // problem forces the details open by tone, not by burying prices below it.
+  const healthy =
+    status.d1Ok && status.problems.filter((p) => p.blocking).length === 0;
+  const summaryBits = [
+    healthy ? "All systems healthy" : "Attention needed",
+    status.schedulerEnabled ? "scheduler on" : "scheduler off",
+    status.lastCron ? `last run ${humanizeDelta(status.lastCron.started_at)}` : "no runs yet",
+    q ? `${q.remainingSafe} searches left` : "quota unknown",
+  ];
 
   return html`
     <div class="page-head">
@@ -140,8 +197,19 @@ export function dashboardPage(args: {
       </div>
     </div>
 
+    <section class="card" aria-labelledby="trackers-heading">
+      <div class="card-head"><h2 id="trackers-heading">Trackers</h2></div>
+      ${trackers.length === 0 ? emptyTrackers() : trackerTable(trackers, tz, args.sparklines)}
+    </section>
+
     <section class="card" aria-labelledby="ops-heading">
-      <div class="card-head"><h2 id="ops-heading">Deployment status</h2></div>
+      <details ${raw(healthy ? "" : "open")}>
+        <summary>
+          <h2 id="ops-heading" class="inline-heading">Deployment status</h2>
+          <span class="small ${healthy ? "muted" : "error-text"}">
+            ${summaryBits.join(" · ")}
+          </span>
+        </summary>
       <dl class="kv">
         <dt>Environment</dt><dd>${status.environment} · Worker ${status.workerVersion}</dd>
         <dt>Database (D1)</dt>
@@ -213,11 +281,7 @@ export function dashboardPage(args: {
             </ul>
           </div>`
         : raw("")}
-    </section>
-
-    <section class="card" aria-labelledby="trackers-heading">
-      <div class="card-head"><h2 id="trackers-heading">Trackers</h2></div>
-      ${trackers.length === 0 ? emptyTrackers() : trackerTable(trackers, tz)}
+      </details>
     </section>
   `;
 }
@@ -231,7 +295,11 @@ function emptyTrackers(): SafeHtml {
   `;
 }
 
-function trackerTable(trackers: TrackerWithMarkets[], tz: string): SafeHtml {
+function trackerTable(
+  trackers: TrackerWithMarkets[],
+  tz: string,
+  sparklines?: Map<number, { at: string; cents: number }[]>,
+): SafeHtml {
   return html`
     <table>
       <thead>
@@ -240,6 +308,7 @@ function trackerTable(trackers: TrackerWithMarkets[], tz: string): SafeHtml {
           <th scope="col">Route</th>
           <th scope="col">Dates</th>
           <th scope="col" class="num">Latest</th>
+          <th scope="col"><span class="visually-hidden">Trend</span></th>
           <th scope="col" class="num">Observed low</th>
           <th scope="col" class="num">Threshold</th>
           <th scope="col">Next check</th>
@@ -254,9 +323,15 @@ function trackerTable(trackers: TrackerWithMarkets[], tz: string): SafeHtml {
               <td class="nowrap">${t.origin} → ${t.destination}</td>
               <td class="nowrap small">${describeDates(t)}</td>
               <td class="num">${formatMoney(t.latest_price_cents, t.currency)}</td>
+              <td>${sparkline(sparklines?.get(t.id))}</td>
               <td class="num">${formatMoney(t.low_price_cents, t.currency)}</td>
               <td class="num">${formatMoney(t.threshold_amount_cents, t.currency)}</td>
-              <td class="nowrap small">${humanizeDelta(t.next_run_at)}</td>
+              <td class="nowrap small">
+                ${humanizeDelta(t.next_run_at)}
+                ${isOverdue(t)
+                  ? html` <span class="badge badge-warning">overdue</span>`
+                  : raw("")}
+              </td>
               <td>${statusBadge(t.status)}</td>
             </tr>
           `,
@@ -297,6 +372,18 @@ export function trackersPage(args: { trackers: TrackerWithMarkets[]; tz: string 
 }
 
 // ---------------------------------------------------------- tracker detail
+export interface PriceContext {
+  /** Latest best-of-run minus the previous one; negative means falling. */
+  trendCents: number | null;
+  rangeLoCents: number | null;
+  rangeHiCents: number | null;
+  observationCount: number;
+  /** Observations that came within 15% of the threshold. */
+  nearThresholdCount: number;
+  /** Suggested threshold when the configured one looks unreachable. */
+  suggestedThresholdCents: number | null;
+}
+
 export function trackerDetailPage(args: {
   tracker: TrackerWithMarkets;
   observations: FareObservationRow[];
@@ -305,8 +392,16 @@ export function trackerDetailPage(args: {
   csrf: string;
   tz: string;
   quotaBlocked: boolean;
+  context?: PriceContext | null;
+  /** Server-rendered SVG for the price history; already safe markup. */
+  chartSvg?: string | null;
+  candidates?: FlexibleDateCandidateRow[];
+  candidateCoverage?: { checked: number; total: number } | null;
 }): SafeHtml {
   const { tracker: t, observations, runs, alerts, csrf, tz } = args;
+  const latest = observations[0];
+  const latestLink = safeHttpsLink(latest?.booking_link ?? latest?.search_link);
+  const completed = t.status === TrackerStatus.COMPLETED;
 
   return html`
     <div class="page-head">
@@ -332,10 +427,26 @@ export function trackerDetailPage(args: {
     </div>
 
     <section class="card">
+      ${completed
+        ? html`<div class="notice notice-info">
+            The travel dates for this tracker have passed, so scheduled checks have stopped
+            and no quota is being spent. The price history below is preserved. Edit the
+            tracker with future dates to start tracking again.
+          </div>`
+        : raw("")}
       <div class="headline-price">
         <div>
           <div class="small muted">Latest observed</div>
-          <div class="num">${formatMoney(t.latest_price_cents, t.currency)}</div>
+          <div class="num">
+            ${latestLink
+              ? html`<a href="${latestLink}" target="_blank" rel="noopener noreferrer"
+                    >${formatMoney(t.latest_price_cents, t.currency)}</a>`
+              : formatMoney(t.latest_price_cents, t.currency)}
+          </div>
+          ${latestLink
+            ? html`<a class="small" href="${latestLink}" target="_blank"
+                  rel="noopener noreferrer">Open on Google Flights ↗</a>`
+            : raw("")}
         </div>
         <div>
           <div class="small muted">Observed low</div>
@@ -346,6 +457,8 @@ export function trackerDetailPage(args: {
           <div class="num">${formatMoney(t.threshold_amount_cents, t.currency)}</div>
         </div>
       </div>
+
+      ${priceContextBlock(args.context ?? null, t)}
 
       <dl class="kv">
         <dt>Status</dt><dd>${statusBadge(t.status)}</dd>
@@ -366,21 +479,36 @@ export function trackerDetailPage(args: {
           : raw("")}
       </dl>
 
-      <form method="post" action="/trackers/${t.id}/check" class="btn-row">
-        ${csrfField(csrf)}
-        <button class="btn btn-primary" type="submit" ${raw(args.quotaBlocked ? "disabled" : "")}>
-          Check now
-        </button>
-        ${args.quotaBlocked
-          ? html`<span class="hint small">
-              The provider allowance is exhausted, so a manual check is unavailable.
-            </span>`
-          : html`<span class="hint small">Uses one provider search per market.</span>`}
-      </form>
+      ${completed
+        ? raw("")
+        : html`<form method="post" action="/trackers/${t.id}/check" class="btn-row">
+            ${csrfField(csrf)}
+            <button class="btn btn-primary" type="submit"
+                    ${raw(args.quotaBlocked ? "disabled" : "")}>
+              Check now
+            </button>
+            <label class="check-row small">
+              <input type="checkbox" name="force_refresh" value="1">
+              <span>Force fresh results (skip the 15-minute cache)</span>
+            </label>
+            ${args.quotaBlocked
+              ? html`<span class="hint small">
+                  The provider allowance is exhausted, so a manual check is unavailable.
+                </span>`
+              : html`<span class="hint small">
+                  Uses one provider search per market.
+                  ${t.last_success_at
+                    ? html` Last successful check ${humanizeDelta(t.last_success_at)}.`
+                    : raw("")}
+                </span>`}
+          </form>`}
     </section>
+
+    ${cheapestDatesCard(t, args.candidates ?? [], args.candidateCoverage ?? null)}
 
     <section class="card" aria-labelledby="history-heading">
       <div class="card-head"><h2 id="history-heading">Price history</h2></div>
+      ${args.chartSvg ? html`<div class="chart-frame">${raw(args.chartSvg)}</div>` : raw("")}
       ${observations.length === 0
         ? html`<div class="empty-state"><p>No observations recorded yet.</p></div>`
         : html`
@@ -393,6 +521,7 @@ export function trackerDetailPage(args: {
                   <th scope="col" class="num">Stops</th>
                   <th scope="col">Dates</th>
                   <th scope="col">Market</th>
+                  <th scope="col"><span class="visually-hidden">Booking link</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -407,6 +536,15 @@ export function trackerDetailPage(args: {
                         ${formatDateShort(o.outbound_date)} – ${formatDateShort(o.return_date)}
                       </td>
                       <td class="small">${o.market}</td>
+                      <td class="small">
+                        ${(() => {
+                          const link = safeHttpsLink(o.booking_link ?? o.search_link);
+                          return link
+                            ? html`<a href="${link}" target="_blank"
+                                  rel="noopener noreferrer">Open ↗</a>`
+                            : raw("");
+                        })()}
+                      </td>
                     </tr>
                   `,
                 )}
@@ -476,6 +614,120 @@ export function trackerDetailPage(args: {
                 )}
               </tbody>
             </table>
+          `}
+    </section>
+  `;
+}
+
+/**
+ * "Should I book?" context. Every statement is about what was observed, never
+ * a prediction -- that stance is the product's spine and stays intact here.
+ */
+function priceContextBlock(context: PriceContext | null, t: TrackerWithMarkets): SafeHtml {
+  if (context === null || context.observationCount < 2) return raw("");
+
+  const bits: SafeHtml[] = [];
+  if (context.trendCents !== null && context.trendCents !== 0) {
+    const falling = context.trendCents < 0;
+    bits.push(
+      html`<span>${falling ? "↓" : "↑"}
+        ${formatMoney(Math.abs(context.trendCents), t.currency)} since the previous check</span>`,
+    );
+  }
+  if (context.rangeLoCents !== null && context.rangeHiCents !== null) {
+    const nearLow =
+      t.latest_price_cents !== null &&
+      context.rangeHiCents > context.rangeLoCents &&
+      t.latest_price_cents - context.rangeLoCents <=
+        (context.rangeHiCents - context.rangeLoCents) * 0.2;
+    bits.push(
+      html`<span>
+        ${nearLow ? "near the observed low — " : ""}range
+        ${formatMoney(context.rangeLoCents, t.currency)}–${formatMoney(
+          context.rangeHiCents,
+          t.currency,
+        )}
+        over ${context.observationCount} observations</span>`,
+    );
+  }
+
+  const hint =
+    context.nearThresholdCount === 0 && context.suggestedThresholdCents !== null
+      ? html`<p class="hint small">
+          None of the ${context.observationCount} observations has come within 15% of your
+          ${formatMoney(t.threshold_amount_cents, t.currency)} threshold. Based on the observed
+          low, a threshold around ${formatMoney(context.suggestedThresholdCents, t.currency)}
+          would be reachable — or keep the current one if it reflects the most you would pay.
+        </p>`
+      : raw("");
+
+  if (bits.length === 0 && hint.toString() === "") return raw("");
+  return html`
+    <div class="small muted" role="status">
+      ${bits.map((bit, index) => (index === 0 ? bit : html` · ${bit}`))}
+    </div>
+    ${hint}
+  `;
+}
+
+/**
+ * The answer a flexible window exists to produce: which dates are cheapest.
+ * Data comes straight from the sweep's own progress rows.
+ */
+function cheapestDatesCard(
+  t: TrackerWithMarkets,
+  candidates: FlexibleDateCandidateRow[],
+  coverage: { checked: number; total: number } | null,
+): SafeHtml {
+  if (t.date_mode !== "custom_window") return raw("");
+
+  const progress =
+    coverage && coverage.total > 0
+      ? `${coverage.checked} of ${coverage.total} date combinations checked in this sweep ` +
+        `(cycle ${t.coverage_cycle}).`
+      : "The first sweep has not started yet.";
+
+  return html`
+    <section class="card" aria-labelledby="dates-heading">
+      <div class="card-head"><h2 id="dates-heading">Cheapest dates so far</h2></div>
+      <p class="small muted">${progress}</p>
+      ${candidates.length === 0
+        ? html`<div class="empty-state">
+            <p>No date combination has a recorded price yet. Prices appear here as the
+            sweep works through the window.</p>
+          </div>`
+        : html`
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Depart</th>
+                  <th scope="col">Return</th>
+                  <th scope="col" class="num">Nights</th>
+                  <th scope="col" class="num">Last seen price</th>
+                  <th scope="col">Checked</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${candidates.map(
+                  (c, index) => html`
+                    <tr>
+                      <td class="nowrap">${formatDateShort(c.outbound_date)}
+                        ${index === 0
+                          ? html` <span class="badge badge-ok">cheapest</span>`
+                          : raw("")}</td>
+                      <td class="nowrap">${formatDateShort(c.return_date)}</td>
+                      <td class="num">${c.nights}</td>
+                      <td class="num">${formatMoney(c.last_price_cents, t.currency)}</td>
+                      <td class="nowrap small">${humanizeDelta(c.last_checked_at)}</td>
+                    </tr>
+                  `,
+                )}
+              </tbody>
+            </table>
+            <p class="disclaimer small">
+              Prices were observed at different times, so they are a guide to which dates
+              tend to be cheaper, not simultaneous quotes.
+            </p>
           `}
     </section>
   `;
@@ -558,16 +810,18 @@ export function trackerFormPage(args: TrackerFormViewArgs): SafeHtml {
         <div class="field">
           <label for="origin">Origin (IATA)</label>
           <input id="origin" name="origin" required maxlength="3" value="${v("origin")}"
-                 autocapitalize="characters" ${invalid("origin")}>
+                 autocapitalize="characters" list="airport-codes" ${invalid("origin")}>
           ${err("origin")}
         </div>
         <div class="field">
           <label for="destination">Destination (IATA)</label>
           <input id="destination" name="destination" required maxlength="3"
-                 value="${v("destination")}" autocapitalize="characters" ${invalid("destination")}>
+                 value="${v("destination")}" autocapitalize="characters" list="airport-codes"
+                 ${invalid("destination")}>
           ${err("destination")}
         </div>
       </div>
+      ${raw(renderAirportDatalist("airport-codes"))}
 
       <!-- ----------------------------------------------------------- dates -->
       <fieldset class="field">
@@ -721,8 +975,20 @@ export function trackerFormPage(args: TrackerFormViewArgs): SafeHtml {
           <input id="threshold_amount" name="threshold_amount" required inputmode="decimal"
                  value="${v("threshold_amount")}" aria-describedby="threshold-hint"
                  ${invalid("threshold_amount")}>
-          <p class="hint small" id="threshold-hint">Whole-party total, in the tracker's currency.</p>
+          <p class="hint small" id="threshold-hint">In the tracker's currency.</p>
           ${err("threshold_amount")}
+        </div>
+        <div class="field">
+          <label for="threshold_basis">Threshold applies to</label>
+          <select id="threshold_basis" name="threshold_basis">
+            <option value="party" ${raw(v("threshold_basis", "party") === "party" ? "selected" : "")}>
+              Whole party
+            </option>
+            <option value="per_traveler"
+                    ${raw(v("threshold_basis") === "per_traveler" ? "selected" : "")}>
+              Per traveler
+            </option>
+          </select>
         </div>
         <div class="field">
           <label for="currency">Currency</label>
@@ -758,6 +1024,18 @@ export function trackerFormPage(args: TrackerFormViewArgs): SafeHtml {
           <input type="number" id="children" name="children" min="0" max="8"
                  value="${v("children", "0")}" ${invalid("children")}>
           ${err("children")}
+        </div>
+        <div class="field">
+          <label for="infants_in_seat">Infants in seat</label>
+          <input type="number" id="infants_in_seat" name="infants_in_seat" min="0" max="4"
+                 value="${v("infants_in_seat", "0")}" ${invalid("infants_in_seat")}>
+          ${err("infants_in_seat")}
+        </div>
+        <div class="field">
+          <label for="infants_on_lap">Lap infants</label>
+          <input type="number" id="infants_on_lap" name="infants_on_lap" min="0" max="4"
+                 value="${v("infants_on_lap", "0")}" ${invalid("infants_on_lap")}>
+          ${err("infants_on_lap")}
         </div>
         <div class="field">
           <label for="cabin">Cabin</label>
@@ -801,7 +1079,47 @@ export function trackerFormPage(args: TrackerFormViewArgs): SafeHtml {
                  value="${v("cooldown_minutes", "360")}" ${invalid("cooldown_minutes")}>
           ${err("cooldown_minutes")}
         </div>
+        <div class="inline-fields">
+          <div class="field">
+            <label for="min_drop_absolute">Only alert for drops of at least</label>
+            <input id="min_drop_absolute" name="min_drop_absolute" inputmode="decimal"
+                   value="${v("min_drop_absolute")}" aria-describedby="min-drop-hint"
+                   ${invalid("min_drop_absolute")}>
+            ${err("min_drop_absolute")}
+          </div>
+          <div class="field">
+            <label for="min_drop_percent">…or at least (%)</label>
+            <input id="min_drop_percent" name="min_drop_percent" inputmode="decimal"
+                   value="${v("min_drop_percent")}" ${invalid("min_drop_percent")}>
+            ${err("min_drop_percent")}
+          </div>
+        </div>
+        <p class="hint small" id="min-drop-hint">
+          Leave blank to alert on every qualifying change. Setting these quiets alerts for
+          drops too small to act on.
+        </p>
       </fieldset>
+
+      <details class="field">
+        <summary>Airline filters (optional)</summary>
+        <div class="inline-fields">
+          <div class="field">
+            <label for="include_airlines">Only these airlines</label>
+            <input id="include_airlines" name="include_airlines"
+                   value="${v("include_airlines")}" placeholder="e.g. NH, UA"
+                   aria-describedby="airlines-hint">
+          </div>
+          <div class="field">
+            <label for="exclude_airlines">Never these airlines</label>
+            <input id="exclude_airlines" name="exclude_airlines"
+                   value="${v("exclude_airlines")}" placeholder="e.g. F9, NK">
+          </div>
+        </div>
+        <p class="hint small" id="airlines-hint">
+          Comma-separated two-letter airline codes. Applied to provider searches where the
+          provider supports it.
+        </p>
+      </details>
 
       <!-- ---------------------------------------------------------- budget -->
       ${budgetBox(args.budget)}

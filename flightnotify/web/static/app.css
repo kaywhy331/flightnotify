@@ -473,3 +473,23 @@ dialog::backdrop { background: rgba(20, 24, 31, .45); }
   .site-nav, .btn, .head-actions { display: none !important; }
   body { background: #fff; }
 }
+
+/* ------------------------------------------------ dashboard status strip */
+/* The ops panel collapses behind a native details element so prices lead the
+   page; a problem re-opens it server-side rather than relying on colour. */
+.card > details > summary {
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  list-style-position: outside;
+}
+.card > details > summary .inline-heading {
+  display: inline;
+  margin: 0;
+  font-size: 1.05rem;
+}
+.card > details[open] > summary { margin-bottom: 0.75rem; }
+
+svg.sparkline { vertical-align: middle; }

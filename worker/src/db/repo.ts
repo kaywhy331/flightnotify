@@ -719,6 +719,43 @@ export class Repo {
   }
 
   // --------------------------------------------------------- flexible dates
+  /**
+   * Retire pending candidates whose departure has already passed.
+   *
+   * Marked checked (with no price) rather than deleted, so the coverage count
+   * still reflects the window the operator configured while the sweep stops
+   * spending searches on flights that can no longer be boarded.
+   */
+  async skipPastCandidates(configVersionId: number, today: string): Promise<number> {
+    const result = await this.db
+      .prepare(
+        `UPDATE flexible_date_candidates
+            SET status = 'checked', last_checked_at = ?3
+          WHERE config_version_id = ?1 AND status = 'pending' AND outbound_date < ?2`,
+      )
+      .bind(configVersionId, today, nowIso())
+      .run();
+    return result.meta.changes ?? 0;
+  }
+
+  /** Cheapest-first view of a window's date pairs, checked ones first. */
+  async candidatePrices(
+    configVersionId: number,
+    cycle: number,
+    limit = 12,
+  ): Promise<FlexibleDateCandidateRow[]> {
+    const result = await this.db
+      .prepare(
+        `SELECT * FROM flexible_date_candidates
+          WHERE config_version_id = ?1 AND cycle = ?2 AND last_price_cents IS NOT NULL
+          ORDER BY last_price_cents ASC, outbound_date ASC
+          LIMIT ?3`,
+      )
+      .bind(configVersionId, cycle, limit)
+      .all<FlexibleDateCandidateRow>();
+    return (result.results ?? []) as FlexibleDateCandidateRow[];
+  }
+
   async claimCandidates(
     configVersionId: number,
     cycle: number,
@@ -809,6 +846,53 @@ export class Repo {
       )
       .bind(configVersionId, cycle)
       .run();
+  }
+
+  /** Per-tracker min/max/count of best-of-run fares since `sinceIso`. */
+  async weeklyObservationStats(
+    sinceIso: string,
+  ): Promise<Map<number, { loCents: number; hiCents: number; count: number }>> {
+    const result = await this.db
+      .prepare(
+        `SELECT tracker_id, MIN(price_amount_cents) AS lo, MAX(price_amount_cents) AS hi,
+                COUNT(*) AS n
+           FROM fare_observations
+          WHERE is_best_of_run = 1 AND eligible = 1 AND observed_at >= ?1
+          GROUP BY tracker_id`,
+      )
+      .bind(sinceIso)
+      .all<{ tracker_id: number; lo: number; hi: number; n: number }>();
+    const map = new Map<number, { loCents: number; hiCents: number; count: number }>();
+    for (const row of (result.results ?? []) as { tracker_id: number; lo: number; hi: number; n: number }[]) {
+      map.set(row.tracker_id, { loCents: row.lo, hiCents: row.hi, count: row.n });
+    }
+    return map;
+  }
+
+  /** Recent best-of-run prices per tracker, one query for the whole list. */
+  async sparklineSeries(limit = 240): Promise<Map<number, { at: string; cents: number }[]>> {
+    const result = await this.db
+      .prepare(
+        `SELECT tracker_id, observed_at, price_amount_cents FROM fare_observations
+          WHERE is_best_of_run = 1 AND eligible = 1
+          ORDER BY observed_at DESC LIMIT ?`,
+      )
+      .bind(limit)
+      .all<{ tracker_id: number; observed_at: string; price_amount_cents: number }>();
+
+    const byTracker = new Map<number, { at: string; cents: number }[]>();
+    for (const row of (result.results ?? []) as {
+      tracker_id: number;
+      observed_at: string;
+      price_amount_cents: number;
+    }[]) {
+      const list = byTracker.get(row.tracker_id) ?? [];
+      list.push({ at: row.observed_at, cents: row.price_amount_cents });
+      byTracker.set(row.tracker_id, list);
+    }
+    // Fetched newest-first for the LIMIT; each series renders oldest-first.
+    for (const list of byTracker.values()) list.reverse();
+    return byTracker;
   }
 
   // ---------------------------------------------------------- auth throttle

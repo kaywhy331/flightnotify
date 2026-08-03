@@ -266,6 +266,23 @@ export class AlertService {
     return { state: DeliveryState.FAILED, detail: result.userMessage || "Delivery failed." };
   }
 
+  /**
+   * Soft heads-up when a fare lands within 5% above the threshold.
+   *
+   * Same dedupe key machinery, cooldown and delivery path as real alerts --
+   * only the decision to send lives in the search service, outside the
+   * golden-vector-locked evaluation module, so Python parity is untouched.
+   */
+  async processApproaching(args: {
+    tracker: TrackerWithMarkets;
+    observation: FareObservationRow;
+    evaluation: Evaluation;
+    coverage: CoverageInfo;
+    chatId: string | null;
+  }): Promise<AlertOutcome> {
+    return this.handleOne({ ...args, alertType: AlertType.APPROACHING, suppressReason: null });
+  }
+
   /** Re-attempt alerts that failed with a retryable error. */
   async retryPending(
     chatId: string | null,
