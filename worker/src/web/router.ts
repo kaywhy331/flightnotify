@@ -17,9 +17,15 @@ import { SerpApiProvider } from "../providers/serpapi.js";
 import { TelegramNotifier } from "../services/telegram.js";
 import { buildTestMessage } from "../services/messages.js";
 import { ensureConfigVersion } from "../services/tracker.js";
-import { RunTrigger, TrackerStatus } from "../domain/enums.js";
-import { centsFromDecimalString } from "../domain/money.js";
-import { nowIso } from "../time.js";
+import { DateMode, RunTrigger, TrackerStatus } from "../domain/enums.js";
+import { nowIso, todayIn } from "../time.js";
+import { humanizeDuration } from "../services/planner.js";
+import {
+  budgetFor,
+  parseTrackerForm,
+  valuesFromTracker,
+  type ParsedTrackerForm,
+} from "./tracker-form.js";
 import {
   checkThrottle,
   clearAuthFailures,
@@ -35,7 +41,7 @@ import {
   verifyPassword,
   verifySessionToken,
 } from "./auth.js";
-import { htmlResponse, layout, redirect, type Flash } from "./html.js";
+import { htmlResponse, layout, redirect, type Flash, type SafeHtml } from "./html.js";
 import { APP_CSS, APP_CSS_ETAG, APP_JS, APP_JS_ETAG } from "./static-assets.js";
 import {
   dashboardPage,
@@ -308,11 +314,7 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
   }
 
   if (url.pathname === "/trackers/new") {
-    return page(
-      "New tracker",
-      "trackers",
-      trackerFormPage({ tracker: null, errors: {}, values: {}, csrf: ctx.csrf }),
-    );
+    return page("New tracker", "trackers", await formView(ctx, null, {}, {}));
   }
 
   const detail = url.pathname.match(/^\/trackers\/(\d+)$/);
@@ -349,12 +351,7 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
     return page(
       `Edit ${tracker.name}`,
       "trackers",
-      trackerFormPage({
-        tracker,
-        errors: {},
-        values: valuesFromTracker(tracker),
-        csrf: ctx.csrf,
-      }),
+      await formView(ctx, tracker.id, valuesFromTracker(tracker as unknown as Record<string, unknown>), {}),
     );
   }
 
@@ -377,25 +374,184 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
   return notFound(ctx);
 }
 
+
+// ------------------------------------------------------------- form helpers
+/** Markets offered in the form. Kept small: each one multiplies search cost. */
+const AVAILABLE_MARKETS = ["us", "gb", "ca", "au", "de", "jp"];
+
+/**
+ * Render the tracker form with a budget preview computed from whatever the
+ * operator has entered so far, so the cost of a window is visible before the
+ * save rather than discovered from a drained allowance a week later.
+ */
+async function formView(
+  ctx: Ctx,
+  trackerId: number | null,
+  values: Record<string, string>,
+  errors: Record<string, string>,
+  parsed?: ParsedTrackerForm,
+): Promise<SafeHtml> {
+  const { quota } = servicesFor(ctx);
+  const snapshot = await quota.snapshot();
+  const effective = parsed ?? parseValuesForEstimate(values, ctx);
+  return trackerFormPage({
+    trackerId,
+    values,
+    errors,
+    csrf: ctx.csrf,
+    today: todayIn(ctx.config.appTimezone),
+    budget: budgetFor(effective, snapshot),
+    availableMarkets: AVAILABLE_MARKETS,
+  });
+}
+
+/** Re-parse stored values through the same code path the form submits use. */
+function parseValuesForEstimate(
+  values: Record<string, string>,
+  ctx: Ctx,
+): ParsedTrackerForm {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(values)) {
+    if (key === "markets") {
+      for (const market of value.split(",").filter(Boolean)) form.append("markets", market);
+    } else if (value !== "") {
+      form.set(key, value);
+    }
+  }
+  return parseTrackerForm(form, {
+    defaultMarket: ctx.config.defaultMarket,
+    today: todayIn(ctx.config.appTimezone),
+  });
+}
+
+/**
+ * Refuse a save whose single scan cannot fit the remaining allowance, and make
+ * a merely-expensive one require an explicit acknowledgement.
+ *
+ * Returns true when the form must be redisplayed. The message lands on
+ * `sampled_mode_ack` because that is the control the operator acts on.
+ */
+async function refuseIfOverBudget(ctx: Ctx, parsed: ParsedTrackerForm): Promise<boolean> {
+  if (Object.keys(parsed.errors).length > 0) return false;
+  const { quota } = servicesFor(ctx);
+  const budget = budgetFor(parsed, await quota.snapshot());
+
+  if (budget.verdict.severity === "blocked") {
+    parsed.errors["sampled_mode_ack"] = budget.verdict.detail;
+    return true;
+  }
+  if (budget.verdict.severity === "warning" && !parsed.sampledModeAck) {
+    parsed.errors["sampled_mode_ack"] =
+      `${budget.verdict.detail} Tick the box below to save it anyway.`;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Write the tracker's config version and, for a custom window, its date-pair
+ * queue.
+ *
+ * Order matters: the config version has to exist first because candidates are
+ * keyed to it, and rebuilding the queue is what makes an edited window take
+ * effect instead of continuing to sweep the previous one.
+ */
+async function persistCandidates(
+  ctx: Ctx,
+  tracker: TrackerWithMarkets,
+  parsed: ParsedTrackerForm,
+): Promise<void> {
+  await ensureConfigVersion(ctx.repo, tracker);
+  const configVersionId = tracker.current_config_version_id;
+  if (configVersionId === null) return;
+
+  if (parsed.dateMode !== DateMode.CUSTOM_WINDOW) {
+    // Leaving a stale queue behind would let a later switch back to a window
+    // resume a sweep the operator never configured.
+    await ctx.repo.replaceCandidates(tracker.id, configVersionId, []);
+    return;
+  }
+
+  await ctx.repo.replaceCandidates(
+    tracker.id,
+    configVersionId,
+    parsed.candidates.map((pair) => ({
+      outbound: pair.outbound,
+      ret: pair.inbound,
+      nights: pair.nights,
+    })),
+  );
+  await ctx.repo.updateTrackerFields(tracker.id, { coverage_cycle: 1 });
+}
+
 // -------------------------------------------------------------- POST routes
 async function postRoute(url: URL, form: FormData, ctx: Ctx): Promise<Response> {
   const { repo, config } = ctx;
 
+  // Live budget preview for the form. Read-only, but still a POST behind the
+  // session guard and the CSRF check, because it echoes back what the operator
+  // typed and reveals their remaining allowance.
+  if (url.pathname === "/api/estimate") {
+    const parsed = parseTrackerForm(form, {
+      defaultMarket: config.defaultMarket,
+      today: todayIn(config.appTimezone),
+    });
+    const { quota } = servicesFor(ctx);
+    const budget = budgetFor(parsed, await quota.snapshot());
+    const dateErrors = [
+      parsed.errors["outbound_date"],
+      parsed.errors["return_date"],
+      parsed.errors["window_outbound_start"],
+      parsed.errors["window_outbound_end"],
+      parsed.errors["min_nights"],
+      parsed.errors["max_nights"],
+      parsed.errors["flex_month"],
+      parsed.errors["flex_duration"],
+    ].filter((message): message is string => Boolean(message));
+
+    return Response.json(
+      {
+        headline: budget.verdict.headline,
+        detail: budget.verdict.detail,
+        severity: budget.verdict.severity,
+        calls_per_scan: budget.estimate.callsPerScan,
+        remaining_safe: (await quota.snapshot()).remainingSafe,
+        monthly_limit: config.monthlySearchBudget,
+        candidate_count: budget.candidateCount,
+        market_count: budget.marketCount,
+        scans_per_full_cycle: budget.estimate.scansPerFullCycle,
+        calls_per_full_cycle: budget.estimate.callsPerFullCycle,
+        full_cycle_duration: humanizeDuration(budget.estimate.fullCycleMinutes),
+        suggestions: budget.verdict.suggestions,
+        date_errors: dateErrors,
+      },
+      { headers: { "Cache-Control": "no-store" } },
+    );
+  }
+
   if (url.pathname === "/trackers") {
-    const { values, errors, fields, markets } = parseTrackerForm(form, config.defaultMarket);
-    if (Object.keys(errors).length > 0) {
+    const parsed = parseTrackerForm(form, {
+      defaultMarket: config.defaultMarket,
+      today: todayIn(config.appTimezone),
+    });
+    const refusal = await refuseIfOverBudget(ctx, parsed);
+    if (Object.keys(parsed.errors).length > 0 || refusal) {
       return htmlResponse(
         layout(
           { title: "New tracker", nav: "trackers", appTimezone: config.appTimezone, authenticated: true },
-          trackerFormPage({ tracker: null, errors, values, csrf: ctx.csrf }),
+          await formView(ctx, null, parsed.values, parsed.errors, parsed),
         ),
         { status: 422 },
       );
     }
-    const id = await repo.insertTracker({ ...fields, created_at: nowIso(), updated_at: nowIso() });
-    await repo.setTrackerMarkets(id, markets);
+    const id = await repo.insertTracker({
+      ...parsed.fields,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+    await repo.setTrackerMarkets(id, parsed.markets);
     const tracker = await repo.getTracker(id);
-    if (tracker) await ensureConfigVersion(repo, tracker);
+    if (tracker) await persistCandidates(ctx, tracker, parsed);
     return redirect(`/trackers/${id}?flash=created`);
   }
 
@@ -403,22 +559,27 @@ async function postRoute(url: URL, form: FormData, ctx: Ctx): Promise<Response> 
   if (update) {
     const tracker = await repo.getTracker(Number(update[1]));
     if (!tracker) return notFound(ctx);
-    const { values, errors, fields, markets } = parseTrackerForm(form, config.defaultMarket);
-    if (Object.keys(errors).length > 0) {
+    const parsed = parseTrackerForm(form, {
+      defaultMarket: config.defaultMarket,
+      today: todayIn(config.appTimezone),
+    });
+    const refusal = await refuseIfOverBudget(ctx, parsed);
+    if (Object.keys(parsed.errors).length > 0 || refusal) {
       return htmlResponse(
         layout(
           { title: "Edit tracker", nav: "trackers", appTimezone: config.appTimezone, authenticated: true },
-          trackerFormPage({ tracker, errors, values, csrf: ctx.csrf }),
+          await formView(ctx, tracker.id, parsed.values, parsed.errors, parsed),
         ),
         { status: 422 },
       );
     }
-    await repo.updateTrackerFields(tracker.id, fields);
-    await repo.setTrackerMarkets(tracker.id, markets);
+    await repo.updateTrackerFields(tracker.id, parsed.fields);
+    await repo.setTrackerMarkets(tracker.id, parsed.markets);
     const fresh = await repo.getTracker(tracker.id);
     // Re-versioning here is what splits the comparison series when a
-    // comparison-relevant field changed.
-    if (fresh) await ensureConfigVersion(repo, fresh);
+    // comparison-relevant field changed; the candidate queue is rebuilt
+    // against whichever config version results.
+    if (fresh) await persistCandidates(ctx, fresh, parsed);
     return redirect(`/trackers/${tracker.id}?flash=saved`);
   }
 
@@ -520,126 +681,6 @@ async function postRoute(url: URL, form: FormData, ctx: Ctx): Promise<Response> 
   }
 
   return notFound(ctx);
-}
-
-// -------------------------------------------------------------------- forms
-function valuesFromTracker(tracker: TrackerWithMarkets): Record<string, string> {
-  const t = tracker as unknown as Record<string, unknown>;
-  const out: Record<string, string> = {};
-  for (const key of [
-    "name",
-    "origin",
-    "destination",
-    "adults",
-    "children",
-    "cabin",
-    "stops",
-    "currency",
-    "outbound_date",
-    "return_date",
-    "check_interval_minutes",
-    "cooldown_minutes",
-  ]) {
-    const value = t[key];
-    if (value !== null && value !== undefined) out[key] = String(value);
-  }
-  const threshold = t["threshold_amount_cents"];
-  if (typeof threshold === "number") out["threshold_amount"] = (threshold / 100).toFixed(2);
-  out["alert_on_threshold"] = t["alert_on_threshold"] === 1 ? "on" : "";
-  out["alert_on_new_low"] = t["alert_on_new_low"] === 1 ? "on" : "";
-  return out;
-}
-
-function parseTrackerForm(
-  form: FormData,
-  defaultMarket: string,
-): {
-  values: Record<string, string>;
-  errors: Record<string, string>;
-  fields: Record<string, unknown>;
-  markets: string[];
-} {
-  const get = (key: string): string => String(form.get(key) ?? "").trim();
-  const values: Record<string, string> = {};
-  const errors: Record<string, string> = {};
-  for (const key of [
-    "name",
-    "origin",
-    "destination",
-    "adults",
-    "children",
-    "cabin",
-    "stops",
-    "currency",
-    "outbound_date",
-    "return_date",
-    "threshold_amount",
-    "check_interval_minutes",
-    "cooldown_minutes",
-  ]) {
-    values[key] = get(key);
-  }
-  values["alert_on_threshold"] = form.get("alert_on_threshold") ? "on" : "";
-  values["alert_on_new_low"] = form.get("alert_on_new_low") ? "on" : "";
-
-  const name = values["name"]!;
-  if (name === "") errors["name"] = "Give the tracker a name.";
-
-  const origin = values["origin"]!.toUpperCase();
-  const destination = values["destination"]!.toUpperCase();
-  if (!/^[A-Z]{3}$/.test(origin)) errors["origin"] = "Use a three-letter IATA airport code.";
-  if (!/^[A-Z]{3}$/.test(destination))
-    errors["destination"] = "Use a three-letter IATA airport code.";
-  if (origin === destination && origin !== "")
-    errors["destination"] = "Origin and destination must differ.";
-
-  const outbound = values["outbound_date"]!;
-  const ret = values["return_date"]!;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(outbound)) errors["outbound_date"] = "Choose an outbound date.";
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ret)) errors["return_date"] = "Choose a return date.";
-  if (!errors["outbound_date"] && !errors["return_date"] && ret < outbound) {
-    errors["return_date"] = "The return date must not be before the outbound date.";
-  }
-
-  let thresholdCents = 0;
-  try {
-    thresholdCents = centsFromDecimalString(values["threshold_amount"]!);
-    if (thresholdCents <= 0) errors["threshold_amount"] = "Enter an amount above zero.";
-  } catch {
-    errors["threshold_amount"] = "Enter an amount such as 1300 or 1300.50.";
-  }
-
-  const adults = Number(values["adults"] || "1");
-  if (!Number.isInteger(adults) || adults < 1) errors["adults"] = "At least one adult is required.";
-
-  const interval = Number(values["check_interval_minutes"] || "720");
-  if (!Number.isInteger(interval) || interval < 15) {
-    errors["check_interval_minutes"] = "The minimum interval is 15 minutes.";
-  }
-
-  const fields: Record<string, unknown> = {
-    name,
-    origin,
-    destination,
-    adults,
-    children: Number(values["children"] || "0"),
-    cabin: values["cabin"] || "economy",
-    stops: values["stops"] || "any",
-    currency: (values["currency"] || "USD").toUpperCase(),
-    date_mode: "exact",
-    outbound_date: outbound,
-    return_date: ret,
-    threshold_amount_cents: thresholdCents,
-    threshold_basis: "party",
-    alert_on_threshold: values["alert_on_threshold"] ? 1 : 0,
-    alert_on_new_low: values["alert_on_new_low"] ? 1 : 0,
-    cooldown_minutes: Number(values["cooldown_minutes"] || "360"),
-    check_interval_minutes: interval,
-    status: TrackerStatus.ACTIVE,
-    updated_at: nowIso(),
-  };
-
-  return { values, errors, fields, markets: [defaultMarket] };
 }
 
 // ------------------------------------------------------------------ helpers

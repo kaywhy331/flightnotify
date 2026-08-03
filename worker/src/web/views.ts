@@ -19,6 +19,7 @@ import {
   CABIN_LABELS,
   DATE_MODE_LABELS,
   DELIVERY_STATE_LABELS,
+  FLEX_DURATION_LABELS,
   RUN_STATUS_LABELS,
   STOPS_LABELS,
   TrackerStatus,
@@ -26,6 +27,8 @@ import {
 import { formatMoney } from "../domain/money.js";
 import { formatDateShort, formatLocal, humanizeDelta } from "../time.js";
 import type { QuotaSnapshot } from "../services/quota.js";
+import { humanizeDuration, SCHEDULE_CHOICES } from "../services/planner.js";
+import type { FormBudget } from "./tracker-form.js";
 import { html, raw, type SafeHtml } from "./html.js";
 
 export interface OperationalStatus {
@@ -489,16 +492,45 @@ function safeList(json: string | null): string {
 }
 
 // ------------------------------------------------------------ tracker form
-export function trackerFormPage(args: {
-  tracker: Partial<TrackerWithMarkets> | null;
+export interface TrackerFormViewArgs {
+  trackerId: number | null;
   errors: Record<string, string>;
   values: Record<string, string>;
   csrf: string;
-}): SafeHtml {
-  const editing = args.tracker?.id !== undefined;
+  today: string;
+  budget: FormBudget | null;
+  /** Markets offered as checkboxes. */
+  availableMarkets: string[];
+}
+
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+/**
+ * Create/edit form.
+ *
+ * The markup deliberately matches the hooks the existing `app.js` already
+ * looks for -- `input[name="date_mode"]`, `[data-date-group]`,
+ * `[data-estimate-url]`, `#budget-estimate`, `#sampled-mode-row` -- so the
+ * mode switching and the live budget preview work with the stylesheet and
+ * script carried over unchanged. Everything it does is also rendered
+ * server-side, so the form is fully usable with JavaScript disabled.
+ */
+export function trackerFormPage(args: TrackerFormViewArgs): SafeHtml {
+  const editing = args.trackerId !== null;
   const v = (key: string, fallback = ""): string => args.values[key] ?? fallback;
   const err = (key: string): SafeHtml =>
-    args.errors[key] ? html`<p class="error-text" id="${key}-error">${args.errors[key]}</p>` : raw("");
+    args.errors[key]
+      ? html`<p class="error-text" id="${key}-error">${args.errors[key]}</p>`
+      : raw("");
+  const invalid = (key: string): SafeHtml =>
+    args.errors[key] ? raw(`aria-invalid="true" aria-describedby="${key}-error"`) : raw("");
+
+  const mode = v("date_mode", "exact");
+  const selectedMarkets = new Set(v("markets", "us").split(",").filter(Boolean));
+  const hiddenUnless = (value: string): SafeHtml => (mode === value ? raw("") : raw("hidden"));
 
   return html`
     <div class="page-head">
@@ -512,53 +544,220 @@ export function trackerFormPage(args: {
         </div>`
       : raw("")}
 
-    <form method="post" action="${editing ? `/trackers/${args.tracker!.id}` : "/trackers"}"
-          class="card">
+    <form method="post" action="${editing ? `/trackers/${args.trackerId}` : "/trackers"}"
+          class="card" data-estimate-url="/api/estimate">
       ${csrfField(args.csrf)}
 
       <div class="field">
         <label for="name">Name</label>
-        <input id="name" name="name" required maxlength="120" value="${v("name")}">
+        <input id="name" name="name" required maxlength="120" value="${v("name")}" ${invalid("name")}>
         ${err("name")}
       </div>
 
       <div class="inline-fields">
         <div class="field">
           <label for="origin">Origin (IATA)</label>
-          <input id="origin" name="origin" required maxlength="3" value="${v("origin")}">
+          <input id="origin" name="origin" required maxlength="3" value="${v("origin")}"
+                 autocapitalize="characters" ${invalid("origin")}>
           ${err("origin")}
         </div>
         <div class="field">
           <label for="destination">Destination (IATA)</label>
           <input id="destination" name="destination" required maxlength="3"
-                 value="${v("destination")}">
+                 value="${v("destination")}" autocapitalize="characters" ${invalid("destination")}>
           ${err("destination")}
         </div>
       </div>
 
+      <!-- ----------------------------------------------------------- dates -->
+      <fieldset class="field">
+        <legend id="date-mode-label">Dates</legend>
+        <div id="date_mode" role="radiogroup" aria-labelledby="date-mode-label">
+          ${(
+            [
+              ["exact", "Exact dates", "One departure and one return."],
+              ["flexible_preset", "Flexible preset", "A whole month and a trip length, in one provider call."],
+              ["custom_window", "Custom flexible window", "A departure range plus a trip-length range, swept across runs."],
+            ] as [string, string, string][]
+          ).map(
+            ([value, label, hint]) => html`
+              <label class="check-row" for="mode-${value}">
+                <input type="radio" id="mode-${value}" name="date_mode" value="${value}"
+                       ${raw(mode === value ? "checked" : "")}>
+                <span>
+                  <strong>${label}</strong>
+                  <span class="small muted"> ${hint}</span>
+                </span>
+              </label>
+            `,
+          )}
+        </div>
+        ${err("date_mode")}
+
+        <div data-date-group="exact" ${hiddenUnless("exact")}>
+          <div class="inline-fields">
+            <div class="field">
+              <label for="outbound_date">Outbound date</label>
+              <input type="date" id="outbound_date" name="outbound_date" min="${args.today}"
+                     value="${v("outbound_date")}" ${invalid("outbound_date")}>
+              ${err("outbound_date")}
+            </div>
+            <div class="field">
+              <label for="return_date">Return date</label>
+              <input type="date" id="return_date" name="return_date" min="${args.today}"
+                     value="${v("return_date")}" ${invalid("return_date")}>
+              ${err("return_date")}
+            </div>
+          </div>
+        </div>
+
+        <div data-date-group="flexible_preset" ${hiddenUnless("flexible_preset")}>
+          <div class="inline-fields">
+            <div class="field">
+              <label for="flex_month">Travel month</label>
+              <select id="flex_month" name="flex_month" ${invalid("flex_month")}>
+                <option value="">Choose a month</option>
+                ${MONTH_NAMES.map(
+                  (label, index) =>
+                    html`<option value="${index + 1}"
+                            ${raw(v("flex_month") === String(index + 1) ? "selected" : "")}>
+                      ${label}
+                    </option>`,
+                )}
+              </select>
+              ${err("flex_month")}
+            </div>
+            <div class="field">
+              <label for="flex_year">Year</label>
+              <input type="number" id="flex_year" name="flex_year" min="2000" max="2100"
+                     value="${v("flex_year", args.today.slice(0, 4))}" ${invalid("flex_year")}>
+              ${err("flex_year")}
+            </div>
+            <div class="field">
+              <label for="flex_duration">Trip length</label>
+              <select id="flex_duration" name="flex_duration" ${invalid("flex_duration")}>
+                <option value="">Choose a length</option>
+                ${Object.entries(FLEX_DURATION_LABELS).map(
+                  ([key, label]) =>
+                    html`<option value="${key}" ${raw(v("flex_duration") === key ? "selected" : "")}>
+                      ${label}
+                    </option>`,
+                )}
+              </select>
+              ${err("flex_duration")}
+            </div>
+          </div>
+          <p class="hint small">
+            Google Travel Explore only looks ahead six months, and answers the whole month in a
+            single provider search.
+          </p>
+        </div>
+
+        <div data-date-group="custom_window" ${hiddenUnless("custom_window")}>
+          <div class="inline-fields">
+            <div class="field">
+              <label for="window_outbound_start">Earliest departure</label>
+              <input type="date" id="window_outbound_start" name="window_outbound_start"
+                     min="${args.today}" value="${v("window_outbound_start")}"
+                     ${invalid("window_outbound_start")}>
+              ${err("window_outbound_start")}
+            </div>
+            <div class="field">
+              <label for="window_outbound_end">Latest departure</label>
+              <input type="date" id="window_outbound_end" name="window_outbound_end"
+                     min="${args.today}" value="${v("window_outbound_end")}"
+                     ${invalid("window_outbound_end")}>
+              ${err("window_outbound_end")}
+            </div>
+          </div>
+          <div class="inline-fields">
+            <div class="field">
+              <label for="min_nights">Minimum nights</label>
+              <input type="number" id="min_nights" name="min_nights" min="1" max="60"
+                     value="${v("min_nights")}" ${invalid("min_nights")}>
+              ${err("min_nights")}
+            </div>
+            <div class="field">
+              <label for="max_nights">Maximum nights</label>
+              <input type="number" id="max_nights" name="max_nights" min="1" max="60"
+                     value="${v("max_nights")}" ${invalid("max_nights")}>
+              ${err("max_nights")}
+            </div>
+            <div class="field">
+              <label for="candidates_per_run">Date pairs checked per run</label>
+              <input type="number" id="candidates_per_run" name="candidates_per_run" min="1"
+                     max="20" value="${v("candidates_per_run", "1")}">
+              <p class="hint small">
+                Each pair costs one provider search per market. A sweep resumes where the last
+                run stopped.
+              </p>
+            </div>
+          </div>
+        </div>
+      </fieldset>
+
+      <!-- --------------------------------------------------------- markets -->
+      <fieldset class="field">
+        <legend>Country markets</legend>
+        <div class="market-grid">
+          ${args.availableMarkets.map(
+            (market) => html`
+              <label class="check-row" for="market-${market}">
+                <input type="checkbox" id="market-${market}" name="markets" value="${market}"
+                       ${raw(selectedMarkets.has(market) ? "checked" : "")}>
+                <span>${market.toUpperCase()}</span>
+              </label>
+            `,
+          )}
+        </div>
+        <p class="hint small">Every extra market multiplies the number of provider searches.</p>
+        ${err("markets")}
+      </fieldset>
+
+      <!-- ------------------------------------------------------ comparison -->
       <div class="inline-fields">
         <div class="field">
-          <label for="outbound_date">Outbound date</label>
-          <input type="date" id="outbound_date" name="outbound_date" value="${v("outbound_date")}">
-          ${err("outbound_date")}
+          <label for="threshold_amount">Alert threshold</label>
+          <input id="threshold_amount" name="threshold_amount" required inputmode="decimal"
+                 value="${v("threshold_amount")}" aria-describedby="threshold-hint"
+                 ${invalid("threshold_amount")}>
+          <p class="hint small" id="threshold-hint">Whole-party total, in the tracker's currency.</p>
+          ${err("threshold_amount")}
         </div>
         <div class="field">
-          <label for="return_date">Return date</label>
-          <input type="date" id="return_date" name="return_date" value="${v("return_date")}">
-          ${err("return_date")}
+          <label for="currency">Currency</label>
+          <input id="currency" name="currency" maxlength="3" value="${v("currency", "USD")}"
+                 ${invalid("currency")}>
+          ${err("currency")}
+        </div>
+        <div class="field">
+          <label for="check_interval_minutes">Check every</label>
+          <select id="check_interval_minutes" name="check_interval_minutes"
+                  ${invalid("check_interval_minutes")}>
+            ${SCHEDULE_CHOICES.map(
+              ([minutes, label]) =>
+                html`<option value="${minutes}"
+                        ${raw(v("check_interval_minutes", "720") === String(minutes) ? "selected" : "")}>
+                  ${label}
+                </option>`,
+            )}
+          </select>
+          ${err("check_interval_minutes")}
         </div>
       </div>
 
       <div class="inline-fields">
         <div class="field">
           <label for="adults">Adults</label>
-          <input type="number" id="adults" name="adults" min="1" max="9" value="${v("adults", "1")}">
+          <input type="number" id="adults" name="adults" min="1" max="9"
+                 value="${v("adults", "1")}" ${invalid("adults")}>
           ${err("adults")}
         </div>
         <div class="field">
           <label for="children">Children</label>
           <input type="number" id="children" name="children" min="0" max="8"
-                 value="${v("children", "0")}">
+                 value="${v("children", "0")}" ${invalid("children")}>
+          ${err("children")}
         </div>
         <div class="field">
           <label for="cabin">Cabin</label>
@@ -584,52 +783,80 @@ export function trackerFormPage(args: {
         </div>
       </div>
 
-      <div class="inline-fields">
-        <div class="field">
-          <label for="threshold_amount">Alert threshold</label>
-          <input id="threshold_amount" name="threshold_amount" required inputmode="decimal"
-                 value="${v("threshold_amount")}" aria-describedby="threshold-hint">
-          <p class="hint small" id="threshold-hint">
-            Whole-party total in the tracker's currency.
-          </p>
-          ${err("threshold_amount")}
-        </div>
-        <div class="field">
-          <label for="currency">Currency</label>
-          <input id="currency" name="currency" maxlength="3" value="${v("currency", "USD")}">
-        </div>
-        <div class="field">
-          <label for="check_interval_minutes">Check every (minutes)</label>
-          <input type="number" id="check_interval_minutes" name="check_interval_minutes"
-                 min="15" value="${v("check_interval_minutes", "720")}">
-          ${err("check_interval_minutes")}
-        </div>
-      </div>
-
       <fieldset class="field">
         <legend>Alerts</legend>
-        <label>
+        <label class="check-row">
           <input type="checkbox" name="alert_on_threshold"
                  ${raw(v("alert_on_threshold", "on") ? "checked" : "")}>
-          Alert when the fare reaches the threshold
+          <span>Alert when the fare reaches the threshold</span>
         </label>
-        <label>
+        <label class="check-row">
           <input type="checkbox" name="alert_on_new_low"
                  ${raw(v("alert_on_new_low", "on") ? "checked" : "")}>
-          Alert on a new observed low
+          <span>Alert on a new observed low</span>
         </label>
         <div class="field">
           <label for="cooldown_minutes">Cooldown (minutes)</label>
           <input type="number" id="cooldown_minutes" name="cooldown_minutes" min="0"
-                 value="${v("cooldown_minutes", "360")}">
+                 value="${v("cooldown_minutes", "360")}" ${invalid("cooldown_minutes")}>
+          ${err("cooldown_minutes")}
         </div>
       </fieldset>
 
+      <!-- ---------------------------------------------------------- budget -->
+      ${budgetBox(args.budget)}
+
+      <div class="field" id="sampled-mode-row" ${raw(args.budget?.verdict.severity === "ok" ? "hidden" : "")}>
+        <label class="check-row">
+          <input type="checkbox" name="sampled_mode_ack"
+                 ${raw(v("sampled_mode_ack") ? "checked" : "")}>
+          <span>
+            I understand this configuration may not complete within the remaining monthly
+            allowance, and that scheduled checks will pause rather than exceed it.
+          </span>
+        </label>
+        ${err("sampled_mode_ack")}
+      </div>
+
       <div class="btn-row">
-        <button class="btn btn-primary" type="submit">${editing ? "Save changes" : "Create tracker"}</button>
-        <a class="btn" href="${editing ? `/trackers/${args.tracker!.id}` : "/trackers"}">Cancel</a>
+        <button class="btn btn-primary" type="submit">
+          ${editing ? "Save changes" : "Create tracker"}
+        </button>
+        <a class="btn" href="${editing ? `/trackers/${args.trackerId}` : "/trackers"}">Cancel</a>
       </div>
     </form>
+  `;
+}
+
+/** Server-rendered budget preview; app.js replaces its contents live. */
+function budgetBox(budget: FormBudget | null): SafeHtml {
+  if (budget === null) {
+    return html`<div class="budget-box" id="budget-estimate" hidden></div>`;
+  }
+  const { estimate: est, verdict } = budget;
+  const tone =
+    verdict.severity === "ok" ? "success" : verdict.severity === "blocked" ? "danger" : "warning";
+
+  return html`
+    <div class="budget-box notice-${tone}" id="budget-estimate" role="status" aria-live="polite">
+      <p class="headline">${verdict.headline}</p>
+      <p>${verdict.detail}</p>
+      <p class="small">
+        Per scan: <strong>${est.callsPerScan}</strong> provider search(es)
+        (${budget.candidateCount > 0 ? budget.candidateCount : 1} date pair(s)
+        × ${budget.marketCount} market(s)).
+      </p>
+      ${budget.candidateCount > 0
+        ? html`<p class="small">
+            Date combinations in this window: <strong>${budget.candidateCount}</strong>.
+            A full sweep takes ${est.scansPerFullCycle} scans
+            (${est.callsPerFullCycle} searches, about ${humanizeDuration(est.fullCycleMinutes)}).
+          </p>`
+        : raw("")}
+      ${verdict.suggestions.length > 0
+        ? html`<ul>${verdict.suggestions.map((s) => html`<li>${s}</li>`)}</ul>`
+        : raw("")}
+    </div>
   `;
 }
 

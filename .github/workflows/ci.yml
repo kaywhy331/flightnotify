@@ -132,11 +132,23 @@ jobs:
         # than during a real cutover.
         run: npx wrangler deploy --dry-run --outdir=dist
 
-      - name: No placeholder or real credentials in the bundle
+      - name: No credentials in the config or the bundle
         run: |
-          # The committed config must not carry a real D1 database id, and no
-          # secret may be inlined into the deployed script.
-          grep -q 'PLACEHOLDER_D1_DATABASE_ID' wrangler.jsonc
+          # The D1 database id is a deployment identifier and is committed on
+          # purpose. Actual credentials must never be: they belong in
+          # `wrangler secret`, which never touches the repository or the bundle.
+          for pattern in \
+            'SERPAPI_API_KEY[\"'\''"]*[:=][[:space:]]*[\"'\''"][A-Za-z0-9]' \
+            'AUTH_PASSWORD_HASH[\"'\''"]*[:=][[:space:]]*[\"'\''"]pbkdf2' \
+            'SESSION_SECRET[\"'\''"]*[:=][[:space:]]*[\"'\''"][A-Za-z0-9]' \
+            'TELEGRAM_CHAT_ID[\"'\''"]*[:=][[:space:]]*[\"'\''"][0-9]'
+          do
+            if grep -rniE "$pattern" wrangler.jsonc src/ migrations/; then
+              echo "::error::a credential appears to be committed"
+              exit 1
+            fi
+          done
+          test ! -f .dev.vars || { echo "::error::.dev.vars must not be committed"; exit 1; }
           if grep -rniE 'serpapi_api_key["'"'"']?\s*[:=]\s*["'"'"'][a-f0-9]{32}' dist/; then
             echo "::error::a SerpApi-shaped key is present in the built bundle"
             exit 1

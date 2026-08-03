@@ -14,9 +14,11 @@
     {
       "binding": "DB",
       "database_name": "flightnotify",
-      // Filled in locally from `npx wrangler d1 create flightnotify`. The
-      // committed value is the placeholder; the real id is account-specific,
-      // so keep it out of version control unless you decide otherwise.
+      // Committed deliberately. A D1 database id is a deployment identifier,
+      // not a credential: it names a database inside an account and is useless
+      // without separate Cloudflare authentication. Committing it keeps deploys
+      // reproducible from a clean clone. Real credentials live only in
+      // `wrangler secret`, never here.
       "database_id": "3fdfa515-ccdc-4048-800f-940fc6662d09",
       "migrations_dir": "migrations"
     }

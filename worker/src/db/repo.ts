@@ -749,6 +749,16 @@ export class Repo {
     return { checked: row?.checked ?? 0, total: row?.total ?? 0 };
   }
 
+  /**
+   * Rebuild a tracker's date-pair queue.
+   *
+   * Deletes by `tracker_id`, not by `config_version_id`: editing a
+   * comparison-relevant field mints a *new* config version, so scoping the
+   * delete to the incoming version would leave the superseded queue behind.
+   * Those rows can never be swept again -- the scheduler only claims
+   * candidates for the tracker's current version -- so they would accumulate
+   * silently and inflate every coverage count.
+   */
   async replaceCandidates(
     trackerId: number,
     configVersionId: number,
@@ -756,8 +766,8 @@ export class Repo {
   ): Promise<void> {
     const statements: D1PreparedStatement[] = [
       this.db
-        .prepare("DELETE FROM flexible_date_candidates WHERE config_version_id = ?")
-        .bind(configVersionId),
+        .prepare("DELETE FROM flexible_date_candidates WHERE tracker_id = ?")
+        .bind(trackerId),
     ];
     candidates.forEach((candidate, index) => {
       statements.push(
