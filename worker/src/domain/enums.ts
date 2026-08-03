@@ -1,7 +1,14 @@
 /** Domain enumerations. Values must match `flightnotify/enums.py` exactly:
  *  they are persisted, so a changed string is a silent data migration. */
 
-export const TrackerStatus = { ACTIVE: "active", PAUSED: "paused", ERROR: "error" } as const;
+export const TrackerStatus = {
+  ACTIVE: "active",
+  PAUSED: "paused",
+  ERROR: "error",
+  // The trip dates have passed. Terminal until the operator edits the
+  // dates, which reactivates the tracker; history stays browsable.
+  COMPLETED: "completed",
+} as const;
 export const DateMode = {
   EXACT: "exact",
   FLEXIBLE_PRESET: "flexible_preset",
@@ -76,7 +83,14 @@ export const PriceScopeLabel = {
   PER_TRAVELER: "per_traveler",
   UNKNOWN: "unknown",
 } as const;
-export const AlertType = { THRESHOLD: "threshold", NEW_LOW: "new_low", TEST: "test" } as const;
+export const AlertType = {
+  THRESHOLD: "threshold",
+  NEW_LOW: "new_low",
+  // Within 5% above the threshold. Decided in the search service, never in
+  // the golden-vector-locked evaluate(), so Python parity is untouched.
+  APPROACHING: "approaching",
+  TEST: "test",
+} as const;
 export const DeliveryState = {
   PENDING: "pending",
   SENT: "sent",
@@ -151,5 +165,6 @@ export const DELIVERY_STATE_LABELS: Record<string, string> = {
 export const ALERT_TYPE_LABELS: Record<string, string> = {
   threshold: "Threshold reached",
   new_low: "New observed low",
+  approaching: "Approaching threshold",
   test: "Test message",
 };

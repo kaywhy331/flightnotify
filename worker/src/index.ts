@@ -9,6 +9,7 @@
 import { loadConfig, type Env } from "./env.js";
 import { Repo } from "./db/repo.js";
 import { runScheduledTick } from "./scheduled.js";
+import { maybeSendWeeklyDigest } from "./services/digest.js";
 import { handleRequest, servicesFor } from "./web/router.js";
 import { htmlResponse, layout } from "./web/html.js";
 import { errorPage } from "./web/views.js";
@@ -68,7 +69,7 @@ export default {
     const repo = new Repo(env.DB);
     // Services are built here rather than inside the tick, so the tick stays
     // testable with a fake runner.
-    const { search } = servicesFor({
+    const { search, notifier, quota } = servicesFor({
       request: new Request("https://scheduled.invalid/"),
       env,
       repo,
@@ -79,6 +80,7 @@ export default {
     const work = runScheduledTick(repo, config, search, {
       cron: controller.cron,
       scheduledTime: controller.scheduledTime,
+      digest: () => maybeSendWeeklyDigest(repo, config, quota, notifier),
     }).then((report) => {
       console.log(
         JSON.stringify({

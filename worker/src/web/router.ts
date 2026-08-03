@@ -20,6 +20,8 @@ import { ensureConfigVersion } from "../services/tracker.js";
 import { DateMode, RunTrigger, TrackerStatus } from "../domain/enums.js";
 import { nowIso, todayIn } from "../time.js";
 import { humanizeDuration } from "../services/planner.js";
+import { renderPriceChart } from "./chart.js";
+import type { PriceContext } from "./views.js";
 import {
   budgetFor,
   parseTrackerForm,
@@ -295,15 +297,22 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
     );
 
   if (url.pathname === "/") {
-    const [status, trackers, alerts] = await Promise.all([
+    const [status, trackers, alerts, sparklines] = await Promise.all([
       operationalStatus(ctx),
       repo.listTrackers(),
       repo.recentAlerts(5),
+      repo.sparklineSeries(),
     ]);
     return page(
       "Dashboard",
       "dashboard",
-      dashboardPage({ status, trackers, recentAlerts: alerts, tz: config.appTimezone }),
+      dashboardPage({
+        status,
+        trackers,
+        recentAlerts: alerts,
+        tz: config.appTimezone,
+        sparklines,
+      }),
       flashesFrom(url),
     );
   }
@@ -321,13 +330,48 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
   if (detail) {
     const tracker = await repo.getTracker(Number(detail[1]));
     if (!tracker) return notFound(ctx);
-    const [observations, runs, alerts] = await Promise.all([
+    const isWindow =
+      tracker.date_mode === DateMode.CUSTOM_WINDOW && tracker.current_config_version_id !== null;
+    const [observations, runs, alerts, candidates, candidateCoverage] = await Promise.all([
       repo.observationsForTracker(tracker.id, 100),
       repo.recentRuns(tracker.id, 15),
       repo.recentAlerts(10),
+      isWindow
+        ? repo.candidatePrices(tracker.current_config_version_id!, tracker.coverage_cycle)
+        : Promise.resolve([]),
+      isWindow
+        ? repo.candidateCoverage(tracker.current_config_version_id!, tracker.coverage_cycle)
+        : Promise.resolve(null),
     ]);
     const { quota } = servicesFor(ctx);
     const snapshot = await quota.snapshot();
+
+    // Chart and context are computed from the best fare of each run so a
+    // single scan that returned 25 offers reads as one point, not a cliff.
+    const bestOfRuns = observations
+      .filter((o) => o.is_best_of_run === 1)
+      .sort((a, b) => a.observed_at.localeCompare(b.observed_at));
+    const chartSvg = renderPriceChart(
+      bestOfRuns.map((o) => ({
+        observedAt: o.observed_at,
+        amountCents: o.price_amount_cents,
+        label: (() => {
+          try {
+            const airlines = o.airlines ? (JSON.parse(o.airlines) as string[]) : [];
+            return airlines.slice(0, 2).join(", ") || tracker.name;
+          } catch {
+            return tracker.name;
+          }
+        })(),
+      })),
+      {
+        currency: tracker.currency,
+        timeZone: config.appTimezone,
+        thresholdCents: tracker.threshold_amount_cents,
+        lowCents: tracker.low_price_cents,
+      },
+    );
+
     return page(
       tracker.name,
       "trackers",
@@ -339,6 +383,10 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
         csrf: ctx.csrf,
         tz: config.appTimezone,
         quotaBlocked: snapshot.remainingHard <= 0,
+        context: priceContextFor(tracker, observations, bestOfRuns),
+        chartSvg: bestOfRuns.length > 0 ? chartSvg : null,
+        candidates,
+        candidateCoverage,
       }),
       flashesFrom(url),
     );
@@ -374,6 +422,44 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
   return notFound(ctx);
 }
 
+
+/**
+ * Book-or-wait context from stored observations. Descriptive only: every
+ * number is something FlightNotify observed, never a prediction.
+ */
+function priceContextFor(
+  tracker: TrackerWithMarkets,
+  observations: { price_amount_cents: number; eligible: number }[],
+  bestOfRuns: { price_amount_cents: number }[],
+): PriceContext {
+  const eligible = observations.filter((o) => o.eligible === 1);
+  const prices = eligible.map((o) => o.price_amount_cents);
+  const lo = prices.length > 0 ? Math.min(...prices) : null;
+  const hi = prices.length > 0 ? Math.max(...prices) : null;
+
+  const latestBest = bestOfRuns[bestOfRuns.length - 1]?.price_amount_cents ?? null;
+  const previousBest = bestOfRuns[bestOfRuns.length - 2]?.price_amount_cents ?? null;
+
+  const threshold = tracker.threshold_amount_cents;
+  // "Within 15%" uses integer math to stay off the float path money never takes.
+  const nearThresholdCount = prices.filter((p) => p * 100 <= threshold * 115).length;
+
+  // Suggest only when the configured threshold has never been approached and a
+  // low exists to anchor on: observed low + 5%, rounded up to the next $50.
+  const suggested =
+    nearThresholdCount === 0 && lo !== null && lo * 100 > threshold * 115
+      ? Math.ceil((lo * 105) / 100 / 5000) * 5000
+      : null;
+
+  return {
+    trendCents: latestBest !== null && previousBest !== null ? latestBest - previousBest : null,
+    rangeLoCents: lo,
+    rangeHiCents: hi,
+    observationCount: eligible.length,
+    nearThresholdCount,
+    suggestedThresholdCents: suggested,
+  };
+}
 
 // ------------------------------------------------------------- form helpers
 /** Markets offered in the form. Kept small: each one multiplies search cost. */
@@ -639,7 +725,9 @@ async function postRoute(url: URL, form: FormData, ctx: Ctx): Promise<Response> 
     if (!locked) return redirect(`/trackers/${tracker.id}?flash=busy`);
     try {
       const { search } = servicesFor(ctx);
-      await search.runTracker(tracker, RunTrigger.MANUAL, { forceRefresh: false });
+      await search.runTracker(tracker, RunTrigger.MANUAL, {
+        forceRefresh: form.get("force_refresh") === "1",
+      });
     } finally {
       await repo.releaseTrackerLock(tracker.id, owner);
     }

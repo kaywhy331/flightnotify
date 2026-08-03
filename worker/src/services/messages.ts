@@ -119,7 +119,11 @@ export function coverageSentence(
 /** Compose the alert body for Telegram's HTML parse mode. */
 export function buildAlertText(ctx: AlertContext, timeZone: string): string {
   const heading =
-    ctx.alertType === AlertType.NEW_LOW ? "✈️ New observed low" : "✈️ Threshold reached";
+    ctx.alertType === AlertType.NEW_LOW
+      ? "✈️ New observed low"
+      : ctx.alertType === AlertType.APPROACHING
+        ? "✈️ Approaching threshold"
+        : "✈️ Threshold reached";
   const cabinLabel = CABIN_LABELS[ctx.cabin] ?? titleCase(ctx.cabin);
 
   const lines: string[] = [
@@ -168,6 +172,9 @@ export function buildAlertText(ctx: AlertContext, timeZone: string): string {
   lines.push(
     escapeHtml(`Threshold: ${formatMoney(ctx.thresholdCents, ctx.currency)} (${basisWord})`),
   );
+  if (ctx.alertType === AlertType.APPROACHING) {
+    lines.push(escapeHtml("Within 5% of the threshold, but not at it yet."));
+  }
   lines.push(escapeHtml(`Checked: ${formatLocal(ctx.observedAt, timeZone)}`));
 
   const coverage = coverageSentence(ctx.coverageChecked, ctx.coverageTotal, ctx.coverageComplete);

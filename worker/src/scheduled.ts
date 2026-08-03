@@ -75,7 +75,14 @@ export async function runScheduledTick(
   repo: Repo,
   config: Config,
   runner: CheckRunner,
-  options: { cron?: string | null; scheduledTime?: number; now?: Date } = {},
+  options: {
+    cron?: string | null;
+    scheduledTime?: number;
+    now?: Date;
+    /** Weekly digest, invoked only while this tick holds the lease so two
+     *  overlapping invocations cannot both send one. */
+    digest?: () => Promise<{ sent: boolean }>;
+  } = {},
 ): Promise<TickReport> {
   const now = options.now ?? new Date();
   const cron = options.cron ?? null;
@@ -197,6 +204,17 @@ export async function runScheduledTick(
       } else {
         report.outcome = "completed";
         report.detail = report.detail || `Checked ${report.trackersCompleted} tracker(s).`;
+      }
+    }
+
+    if (options.digest) {
+      try {
+        const digest = await options.digest();
+        if (digest.sent) report.alertsSent += 1;
+      } catch (error) {
+        // The digest is a nicety; it must never fail a tick that did real work.
+        report.telegramFailures += 1;
+        report.detail = report.detail || describeError(error);
       }
     }
 
