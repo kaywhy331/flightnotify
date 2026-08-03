@@ -8,6 +8,7 @@ flightnotify check-once   run every due tracker once and exit (cron-friendly)
 flightnotify backup       make a consistent copy of the SQLite database
 flightnotify failures     show recent failed checks and undelivered alerts
 flightnotify status       show quota, scheduler and setup state
+flightnotify export-d1    export the database as Cloudflare D1 SQL
 """
 
 from __future__ import annotations
@@ -354,6 +355,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- export-d1
+def cmd_export_d1(args: argparse.Namespace) -> int:
+    # No _bootstrap(): the source database is named explicitly, so this command
+    # deliberately reads neither .env nor the configured DATABASE_URL.
+    from .d1_export import run as run_export
+
+    return run_export(args)
+
+
 # --------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="flightnotify", description=__doc__.split("\n")[0])
@@ -399,6 +409,33 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="show quota, scheduler and setup state")
     status.add_argument("--sync", action="store_true", help="refresh quota from SerpApi (free)")
     status.set_defaults(func=cmd_status)
+
+    export = sub.add_parser("export-d1", help="export the database as Cloudflare D1 SQL")
+    export.add_argument("--source", help="SQLite database to export (required; never guessed)")
+    export.add_argument("--output", help="destination .sql file (required with --write)")
+    export.add_argument(
+        "--write", action="store_true", help="emit the SQL (the default is a dry run)"
+    )
+    export.add_argument(
+        "--dry-run", action="store_true", help="summarise and write nothing (the default)"
+    )
+    export.add_argument(
+        "--allow-unsafe-source",
+        action="store_true",
+        help="accept a source path that looks like a fixture or scratch copy",
+    )
+    export.add_argument(
+        "--exclude-tracker",
+        type=int,
+        action="append",
+        metavar="ID",
+        help="omit this tracker and every row referencing it (repeatable)",
+    )
+    export.add_argument(
+        "--verify", action="store_true", help="re-check the source against --expect-json"
+    )
+    export.add_argument("--expect-json", help="counts manifest written alongside --output")
+    export.set_defaults(func=cmd_export_d1)
 
     return parser
 

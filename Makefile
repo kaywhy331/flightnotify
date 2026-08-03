@@ -74,6 +74,21 @@ docker-down: ## Stop the container (the data volume is kept)
 docker-logs: ## Follow container logs
 	docker compose logs -f
 
+golden: ## Regenerate the Python->Worker behavioural golden vectors
+	$(PY) -m tests.golden.generate_vectors > worker/test/golden/vectors.json
+
+worker-install: ## Install the Cloudflare Worker toolchain
+	cd worker && npm install
+
+worker-check: ## Typecheck, test and build the Worker (no Cloudflare account needed)
+	cd worker && npx wrangler types && npx tsc --noEmit
+	cd worker && npx vitest run
+	cd worker && npx vitest run --config vitest.workers.config.ts
+	cd worker && npx wrangler deploy --dry-run --outdir=dist
+
+worker-dev: ## Run the Worker locally against a local D1 (http://localhost:8788)
+	cd worker && npx wrangler dev --local --port 8788 --test-scheduled
+
 clean: ## Remove caches (never the database)
 	rm -rf .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage
 	find . -name '__pycache__' -type d -prune -exec rm -rf {} +
