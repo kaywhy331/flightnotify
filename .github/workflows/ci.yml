@@ -122,7 +122,7 @@ jobs:
           npx wrangler d1 migrations apply flightnotify --local
           npx wrangler d1 execute flightnotify --local \
             --command "SELECT value FROM schema_meta WHERE key='schema_version';" \
-            | grep -q '"value": "1"'
+            | grep -q '"value": "2"'
 
       - name: Integration tests (D1, Cron, lease recovery, auth)
         run: npx vitest run --config vitest.workers.config.ts
@@ -141,7 +141,8 @@ jobs:
             'SERPAPI_API_KEY[\"'\''"]*[:=][[:space:]]*[\"'\''"][A-Za-z0-9]' \
             'AUTH_PASSWORD_HASH[\"'\''"]*[:=][[:space:]]*[\"'\''"]pbkdf2' \
             'SESSION_SECRET[\"'\''"]*[:=][[:space:]]*[\"'\''"][A-Za-z0-9]' \
-            'TELEGRAM_CHAT_ID[\"'\''"]*[:=][[:space:]]*[\"'\''"][0-9]'
+            'TELEGRAM_CHAT_ID[\"'\''"]*[:=][[:space:]]*[\"'\''"][0-9]' \
+            'TELEGRAM_WEBHOOK_SECRET[\"'\''"]*[:=][[:space:]]*[\"'\''"][A-Za-z0-9_-]'
           do
             if grep -rniE "$pattern" wrangler.jsonc src/ migrations/; then
               echo "::error::a credential appears to be committed"

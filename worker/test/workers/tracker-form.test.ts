@@ -156,6 +156,8 @@ describe("authentication and CSRF on mutations", () => {
     ["POST", "/api/estimate"],
     ["POST", "/settings/test-message"],
     ["POST", "/settings/discover-chat"],
+    ["POST", "/settings/telegram-webhook/enable"],
+    ["POST", "/settings/telegram-webhook/disable"],
   ];
 
   for (const [method, path] of mutations) {
@@ -197,6 +199,20 @@ describe("authentication and CSRF on mutations", () => {
       testEnv(),
     );
     expect(authed.status).toBe(200);
+  });
+
+  it("shows Telegram commands as optional and disabled until their secret is set", async () => {
+    const cookie = await signIn();
+    const response = await handleRequest(
+      new Request(`${BASE}/settings`, { headers: { Cookie: cookie } }),
+      testEnv(),
+    );
+    const html = await response.text();
+    expect(response.status).toBe(200);
+    expect(html).toContain("Telegram commands");
+    expect(html).toContain("Webhook disabled");
+    expect(html).toContain("No webhook secret");
+    expect(html).toContain('action="/settings/telegram-webhook/enable"');
   });
 });
 

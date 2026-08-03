@@ -99,7 +99,7 @@ describe("migrations", () => {
     const row = await env.DB.prepare(
       "SELECT value FROM schema_meta WHERE key = 'schema_version'",
     ).first<{ value: string }>();
-    expect(row?.value).toBe("1");
+    expect(row?.value).toBe("2");
 
     const health = await repo().health();
     expect(health.ok).toBe(true);

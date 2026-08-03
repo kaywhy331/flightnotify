@@ -70,6 +70,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     queryCacheTtlSeconds: 900,
     telegramBotToken: "",
     telegramChatId: "",
+    telegramWebhookSecret: "",
     telegramBaseUrl: "https://api.telegram.invalid",
     authPasswordHash: "argon-hash",
     sessionSecret: "s".repeat(32),

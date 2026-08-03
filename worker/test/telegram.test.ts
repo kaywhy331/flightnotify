@@ -434,6 +434,65 @@ describe("getUpdates", () => {
   });
 });
 
+describe("webhook management", () => {
+  it("registers only message updates and serialises delivery", async () => {
+    const { client, calls } = notifier({ ok: true, result: true });
+    const secret = "webhook_secret_" + "x".repeat(32);
+    const result = await client.setWebhook(
+      "https://flightnotify.example/telegram/webhook",
+      secret,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.userMessage).toBe("Telegram command webhook enabled.");
+    expect(calls[0]!.url.endsWith("/setWebhook")).toBe(true);
+    expect(calls[0]!.body.get("url")).toBe(
+      "https://flightnotify.example/telegram/webhook",
+    );
+    expect(calls[0]!.body.get("secret_token")).toBe(secret);
+    expect(calls[0]!.body.get("max_connections")).toBe("1");
+    expect(calls[0]!.body.get("allowed_updates")).toBe('["message"]');
+  });
+
+  it("rejects an invalid URL or secret without touching Telegram", async () => {
+    const { client, calls } = notifier({ ok: true, result: true });
+    expect((await client.setWebhook("http://example.test/hook", "x".repeat(40))).ok).toBe(false);
+    expect((await client.setWebhook("https://example.test/hook", "too short")).ok).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("parses webhook status without trusting response shapes", async () => {
+    const { client } = notifier({
+      ok: true,
+      result: {
+        url: "https://flightnotify.example/telegram/webhook",
+        pending_update_count: 2,
+        last_error_date: 1785770000,
+        last_error_message: "temporary failure",
+        max_connections: 1,
+        allowed_updates: ["message", 42],
+      },
+    });
+    const { info, result } = await client.getWebhookInfo();
+    expect(result.ok).toBe(true);
+    expect(info).toEqual({
+      url: "https://flightnotify.example/telegram/webhook",
+      pendingUpdateCount: 2,
+      lastErrorDate: 1785770000,
+      lastErrorMessage: "temporary failure",
+      maxConnections: 1,
+      allowedUpdates: ["message"],
+    });
+  });
+
+  it("removes a webhook without dropping queued updates", async () => {
+    const { client, calls } = notifier({ ok: true, result: true });
+    expect((await client.deleteWebhook()).ok).toBe(true);
+    expect(calls[0]!.url.endsWith("/deleteWebhook")).toBe(true);
+    expect(calls[0]!.body.get("drop_pending_updates")).toBe("false");
+  });
+});
+
 describe("discoverChats", () => {
   const privateUpdate = (id: number, date: number, name: string, username?: string) => ({
     update_id: id,

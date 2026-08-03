@@ -1,7 +1,7 @@
 /**
  * Row shapes as D1 returns them.
  *
- * These mirror worker/migrations/0001_initial_schema.sql exactly, including
+ * These mirror the committed D1 migrations exactly, including
  * the `_cents` / `_bp` suffixes and the INTEGER-as-boolean columns. Keeping the
  * raw shape separate from the domain shape means a schema change fails at the
  * type level here rather than surfacing as a wrong number three layers up.
@@ -242,6 +242,18 @@ export interface AppSettingRow {
   key: string;
   value: string | null;
   updated_at: string;
+}
+
+export interface TelegramUpdateRow {
+  update_id: number;
+  state: "processing" | "ready" | "delivered" | "ignored" | "failed";
+  chat_id: string | null;
+  command: string | null;
+  reply_text: string | null;
+  received_at: string;
+  updated_at: string;
+  delivery_attempts: number;
+  last_error: string | null;
 }
 
 export interface AuthThrottleRow {

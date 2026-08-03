@@ -30,6 +30,7 @@ import {
 import { formatMoney } from "../domain/money.js";
 import { formatDateShort, formatLocal, humanizeDelta, parseIsoOrNull } from "../time.js";
 import type { QuotaSnapshot } from "../services/quota.js";
+import type { TelegramWebhookInfo } from "../services/telegram.js";
 import { humanizeDuration, SCHEDULE_CHOICES } from "../services/planner.js";
 import type { FormBudget } from "./tracker-form.js";
 import { html, raw, type SafeHtml } from "./html.js";
@@ -51,6 +52,7 @@ export interface OperationalStatus {
   serpapiConfigured: boolean;
   telegramConfigured: boolean;
   telegramChatConfigured: boolean;
+  telegramWebhookSecretConfigured: boolean;
   telegramHint: string | null;
   trackerCount: number;
   observationCount: number;
@@ -1344,10 +1346,23 @@ export function settingsPage(args: {
   csrf: string;
   discovered: { chatId: number; displayName: string; lastText: string | null }[] | null;
   discoverError: string | null;
+  webhook: {
+    expectedUrl: string;
+    info: TelegramWebhookInfo | null;
+    error: string | null;
+  };
   tz: string;
 }): SafeHtml {
   const { status, csrf } = args;
   const q = status.quota;
+  const webhookEnabled = (args.webhook.info?.url ?? "") !== "";
+  const webhookMatches = args.webhook.info?.url === args.webhook.expectedUrl;
+  const webhookReady =
+    webhookEnabled && webhookMatches && status.telegramWebhookSecretConfigured;
+  const canEnableWebhook =
+    status.telegramConfigured &&
+    status.telegramChatConfigured &&
+    status.telegramWebhookSecretConfigured;
 
   return html`
     <div class="page-head"><h1>Settings</h1></div>
@@ -1374,6 +1389,48 @@ export function settingsPage(args: {
             The chat id is stored as a Worker secret, not in the database.
           </div>
         </dd>
+        <dt>Telegram commands</dt>
+        <dd>
+          ${badge(
+            webhookReady,
+            "Webhook enabled",
+            webhookEnabled && !status.telegramWebhookSecretConfigured
+              ? "Webhook secret missing"
+              : webhookEnabled
+                ? "Different URL registered"
+                : "Webhook disabled",
+          )}
+          ${badge(
+            status.telegramWebhookSecretConfigured,
+            "Secret configured",
+            "No webhook secret",
+          )}
+          ${args.webhook.info
+            ? html`<div class="small muted">
+                ${webhookEnabled
+                  ? html`Registered URL: <span class="mono">${args.webhook.info.url}</span> · `
+                  : raw("")}
+                ${args.webhook.info.pendingUpdateCount} pending update(s)
+                ${args.webhook.info.maxConnections !== null
+                  ? html` · ${args.webhook.info.maxConnections} connection(s)`
+                  : raw("")}
+              </div>`
+            : raw("")}
+          ${args.webhook.info?.lastErrorMessage
+            ? html`<div class="small error-text">
+                Last delivery error${args.webhook.info.lastErrorDate !== null
+                  ? html` at ${formatLocal(
+                      new Date(args.webhook.info.lastErrorDate * 1000),
+                      args.tz,
+                    )}`
+                  : raw("")}: ${args.webhook.info.lastErrorMessage}
+              </div>`
+            : raw("")}
+          <div class="small muted">
+            Commands are accepted only from the configured private chat. Telegram webhook
+            retries are deduplicated before a command can run again.
+          </div>
+        </dd>
       </dl>
 
       <div class="btn-row">
@@ -1386,11 +1443,36 @@ export function settingsPage(args: {
         </form>
         <form method="post" action="/settings/discover-chat" class="inline-fields">
           ${csrfField(csrf)}
-          <button class="btn" type="submit" ${raw(status.telegramConfigured ? "" : "disabled")}>
+          <button class="btn" type="submit"
+                  ${raw(status.telegramConfigured && !webhookEnabled ? "" : "disabled")}>
             Discover chat
           </button>
         </form>
+        <form method="post" action="/settings/telegram-webhook/enable" class="inline-fields">
+          ${csrfField(csrf)}
+          <button class="btn" type="submit" ${raw(canEnableWebhook ? "" : "disabled")}>
+            Enable commands
+          </button>
+        </form>
+        <form method="post" action="/settings/telegram-webhook/disable" class="inline-fields">
+          ${csrfField(csrf)}
+          <button class="btn" type="submit" ${raw(webhookEnabled ? "" : "disabled")}>
+            Disable commands
+          </button>
+        </form>
       </div>
+
+      ${webhookEnabled
+        ? html`<p class="hint small">
+            Chat discovery is unavailable while a Telegram webhook is active. Disable commands
+            first if you need to discover a different chat.
+          </p>`
+        : raw("")}
+      ${args.webhook.error
+        ? html`<div class="notice notice-warning">
+            Telegram webhook status could not be loaded: ${args.webhook.error}
+          </div>`
+        : raw("")}
 
       ${args.discoverError
         ? html`<div class="notice notice-warning">${args.discoverError}</div>`

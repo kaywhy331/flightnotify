@@ -16,6 +16,7 @@ import { SearchService } from "../services/search.js";
 import { SerpApiProvider } from "../providers/serpapi.js";
 import { TelegramNotifier } from "../services/telegram.js";
 import { buildTestMessage } from "../services/messages.js";
+import { TelegramBot } from "../services/bot.js";
 import { ensureConfigVersion } from "../services/tracker.js";
 import { DateMode, RunTrigger, TrackerStatus } from "../domain/enums.js";
 import { nowIso, todayIn } from "../time.js";
@@ -45,6 +46,7 @@ import {
 } from "./auth.js";
 import { htmlResponse, layout, redirect, type Flash, type SafeHtml } from "./html.js";
 import { APP_CSS, APP_CSS_ETAG, APP_JS, APP_JS_ETAG } from "./static-assets.js";
+import { handleTelegramWebhook } from "./telegram-webhook.js";
 import {
   dashboardPage,
   errorPage,
@@ -101,6 +103,26 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
 
   const repo = new Repo(env.DB);
+  if (url.pathname === "/telegram/webhook") {
+    const { notifier, quota, search } = servicesFor({
+      request,
+      env,
+      repo,
+      config,
+      csrf: "",
+    });
+    return handleTelegramWebhook(request, {
+      secret: config.telegramWebhookSecret,
+      bot: new TelegramBot({
+        repo,
+        config,
+        notifier,
+        quota,
+        search,
+        version: WORKER_VERSION,
+      }),
+    });
+  }
   const session = await verifySessionToken(
     config.sessionSecret,
     readCookie(request, SESSION_COOKIE),
@@ -245,6 +267,18 @@ function servicesFor(ctx: Ctx) {
   return { provider, notifier, quota, alerts, search };
 }
 
+async function telegramWebhookStatus(ctx: Ctx) {
+  const expectedUrl = `${new URL(ctx.request.url).origin}/telegram/webhook`;
+  const { notifier } = servicesFor(ctx);
+  if (!notifier.isConfigured()) return { expectedUrl, info: null, error: null };
+  const status = await notifier.getWebhookInfo();
+  return {
+    expectedUrl,
+    info: status.info,
+    error: status.result.ok ? null : status.result.userMessage,
+  };
+}
+
 async function operationalStatus(ctx: Ctx): Promise<OperationalStatus> {
   const { repo, config } = ctx;
   const [health, state, cronRuns, trackers] = await Promise.all([
@@ -285,6 +319,7 @@ async function operationalStatus(ctx: Ctx): Promise<OperationalStatus> {
     serpapiConfigured: config.serpapiApiKey !== "",
     telegramConfigured: config.telegramBotToken !== "",
     telegramChatConfigured: config.telegramChatId !== "",
+    telegramWebhookSecretConfigured: config.telegramWebhookSecret !== "",
     telegramHint: telegramTokenHint(config.telegramBotToken),
     trackerCount: trackers.length,
     observationCount,
@@ -408,7 +443,10 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
   }
 
   if (url.pathname === "/settings") {
-    const status = await operationalStatus(ctx);
+    const [status, webhook] = await Promise.all([
+      operationalStatus(ctx),
+      telegramWebhookStatus(ctx),
+    ]);
     return page(
       "Settings",
       "settings",
@@ -417,6 +455,7 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
         csrf: ctx.csrf,
         discovered: null,
         discoverError: null,
+        webhook,
         tz: config.appTimezone,
       }),
       flashesFrom(url),
@@ -766,9 +805,45 @@ async function postRoute(url: URL, form: FormData, ctx: Ctx): Promise<Response> 
             lastText: c.lastText,
           })),
           discoverError: discovery.result.ok ? null : discovery.result.userMessage,
+          webhook: await telegramWebhookStatus(ctx),
           tz: config.appTimezone,
         }),
       ),
+    );
+  }
+
+  const webhookAction = url.pathname.match(/^\/settings\/telegram-webhook\/(enable|disable)$/);
+  if (webhookAction) {
+    const { notifier } = servicesFor(ctx);
+    if (webhookAction[1] === "enable") {
+      if (
+        !notifier.isConfigured() ||
+        config.telegramChatId === "" ||
+        config.telegramWebhookSecret === ""
+      ) {
+        return redirect("/settings?flash=telegram_webhook_missing");
+      }
+      const target = `${new URL(ctx.request.url).origin}/telegram/webhook`;
+      const result = await notifier.setWebhook(target, config.telegramWebhookSecret);
+      if (!result.ok) {
+        console.error(
+          JSON.stringify({ event: "telegram_webhook_enable_failed", category: result.category }),
+        );
+      }
+      return redirect(
+        `/settings?flash=${result.ok ? "telegram_webhook_enabled" : "telegram_webhook_enable_failed"}`,
+      );
+    }
+
+    if (!notifier.isConfigured()) return redirect("/settings?flash=telegram_missing");
+    const result = await notifier.deleteWebhook();
+    if (!result.ok) {
+      console.error(
+        JSON.stringify({ event: "telegram_webhook_disable_failed", category: result.category }),
+      );
+    }
+    return redirect(
+      `/settings?flash=${result.ok ? "telegram_webhook_disabled" : "telegram_webhook_disable_failed"}`,
     );
   }
 
@@ -796,6 +871,27 @@ const FLASH_MESSAGES: Record<string, Flash> = {
   telegram_missing: {
     level: "warning",
     message: "Telegram is not fully configured, so no message was sent.",
+  },
+  telegram_webhook_enabled: {
+    level: "success",
+    message: "Telegram commands enabled for this deployment URL.",
+  },
+  telegram_webhook_enable_failed: {
+    level: "danger",
+    message: "Telegram did not enable the command webhook. Check the status below and Worker logs.",
+  },
+  telegram_webhook_disabled: {
+    level: "success",
+    message: "Telegram commands disabled. Alert delivery is unchanged.",
+  },
+  telegram_webhook_disable_failed: {
+    level: "danger",
+    message: "Telegram did not disable the command webhook. Check the status below and Worker logs.",
+  },
+  telegram_webhook_missing: {
+    level: "warning",
+    message:
+      "Set the bot token, chat id and TELEGRAM_WEBHOOK_SECRET before enabling commands.",
   },
 };
 

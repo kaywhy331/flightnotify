@@ -192,8 +192,10 @@ secret (OAuth2, exchanged for a short-lived token that FlightNotify caches and r
 
 ## Telegram commands
 
-The bot can answer commands as well as send alerts. It is **off by default** — set
-`BOT_ENABLED=true` and restart.
+The bot can answer commands as well as send alerts. In the Python service it is
+**off by default** — set `BOT_ENABLED=true` and restart. In the Cloudflare
+Worker deployment, set the optional `TELEGRAM_WEBHOOK_SECRET` and use Settings
+→ *Enable commands*; see [the Cloudflare guide](docs/CLOUDFLARE.md).
 
 | Command | What it does |
 |---|---|
@@ -219,8 +221,9 @@ there would be nothing to authorise against. Anyone who *does* have access to yo
 your provider quota with `/check` — the bot is exactly as trusted as that chat.
 
 **Enabling the bot disables "Discover chat".** Telegram delivers each update to a single reader;
-once the poller is consuming them, the Settings discovery button finds nothing. Connect your chat
-first, or set `BOT_ENABLED=false` and restart to discover again.
+once the Python poller or Worker webhook is consuming them, the Settings discovery button finds
+nothing. Connect your chat first. For Python, set `BOT_ENABLED=false` and restart to discover
+again; for Workers, press *Disable commands*.
 
 ---
 

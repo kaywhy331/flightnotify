@@ -264,6 +264,7 @@ beforeEach(async () => {
     // A cached stub payload would short-circuit the live path of a later test.
     "query_cache",
     "cron_runs",
+    "telegram_updates",
     "auth_throttle",
     "app_settings",
   ]) {
@@ -580,7 +581,7 @@ describe("itinerary detail in the price history", () => {
 });
 
 // ------------------------------------------------------------ housekeeping
-describe("cron_runs retention", () => {
+describe("operational history retention", () => {
   const fakeRunner = (): CheckRunner => ({
     async runTracker() {
       throw new Error("no tracker is due in this test");
@@ -598,6 +599,15 @@ describe("cron_runs retention", () => {
         .bind(startedAt)
         .run();
     }
+    for (const [updateId, updatedAt] of [[1, old], [2, fresh]] as const) {
+      await env.DB.prepare(
+        `INSERT INTO telegram_updates
+           (update_id, state, received_at, updated_at)
+         VALUES (?, 'delivered', ?, ?)`,
+      )
+        .bind(updateId, updatedAt, updatedAt)
+        .run();
+    }
 
     await runScheduledTick(repo(), configFor({ SCHEDULER_ENABLED: "true" }), fakeRunner());
 
@@ -608,5 +618,10 @@ describe("cron_runs retention", () => {
     expect(kept).not.toContain(old);
     // The tick's own row survives its prune.
     expect(kept).toHaveLength(2);
+
+    const updates = await env.DB.prepare(
+      "SELECT update_id FROM telegram_updates ORDER BY update_id",
+    ).all<{ update_id: number }>();
+    expect((updates.results ?? []).map((row) => row.update_id)).toEqual([2]);
   });
 });

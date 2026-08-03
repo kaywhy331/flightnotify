@@ -45,7 +45,7 @@ Preserved, and verified by tests:
 - provider quota accounting, including the reserve held back for manual checks
 - observation history and observed lows, scoped to a comparison series
 - threshold and new-low Telegram alerts, cooldown and deduplication
-- Telegram chat discovery, integration status and test message
+- Telegram chat discovery, integration status, test message and authenticated command webhook
 - loading, empty, stale, error and recovery states
 - the existing stylesheet, markup structure and accessibility affordances
 
@@ -113,6 +113,7 @@ npx wrangler secret put SESSION_SECRET   # >= 32 random characters
 npx wrangler secret put SERPAPI_API_KEY
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET  # optional commands; 32-256 A-Z/a-z/0-9/_/-
 ```
 
 Generate a session secret with:
@@ -120,6 +121,13 @@ Generate a session secret with:
 ```bash
 node -e "console.log(crypto.randomUUID()+crypto.randomUUID())"
 ```
+
+For `TELEGRAM_WEBHOOK_SECRET`, generate at least 32 random characters in a
+password manager using only letters, numbers, `_` and `-`, then enter it at
+Wrangler's interactive prompt. It is independent of the bot token and session
+secret. Leave it unset if you want send-only Telegram alerts.
+After rotating this secret, press *Enable commands* again so Telegram starts
+sending the new value in its webhook header.
 
 Non-secret settings live in `wrangler.jsonc` under `vars`: `APP_TIMEZONE`,
 `DEFAULT_CURRENCY`, `DEFAULT_MARKET`, `SERPAPI_PRICE_SCOPE`,
@@ -204,7 +212,14 @@ they exist to guarantee **exactly one scheduler is ever live**.
 4. **Configure secrets** (section 3).
 5. **Verify authentication and read-only UI.** Sign in at the workers.dev URL.
    Confirm the imported tracker, its history and its observed low.
-6. **Verify Telegram.** Settings → *Send test message*. Exactly one message.
+6. **Verify Telegram.** Before enabling commands, send `/start` to the bot and
+   use Settings → *Discover chat* if `TELEGRAM_CHAT_ID` is not set. Then:
+   - Settings → *Send test message*. Exactly one message.
+   - Optional: after setting `TELEGRAM_WEBHOOK_SECRET`, press *Enable commands*.
+   - Send `/status` and `/trackers` in the configured private chat. Do not use
+     `/check` during cutover unless you intend to spend a provider search.
+   Telegram disables `getUpdates` while a webhook is active, so chat discovery
+   stays disabled until *Disable commands* is pressed.
 7. **Verify SerpApi only if necessary**, with at most one live search
    (tracker → *Check now*).
 8. **Stop the old scheduler.**
@@ -282,11 +297,16 @@ tracker would start a *new* comparison series and orphan its price history.
 | List migrations | `npx wrangler d1 migrations list flightnotify --remote` |
 | Health check | `curl https://<worker>.workers.dev/healthz` |
 | Enable/disable scheduling | edit `SCHEDULER_ENABLED` in `wrangler.jsonc`, redeploy |
+| Enable/disable Telegram commands | Settings → *Enable commands* / *Disable commands* |
 
 The dashboard surfaces deployment environment, D1 connectivity and schema
 version, scheduler enabled/disabled, last Cron invocation and its outcome,
 active lease, next due search, SerpApi quota, Telegram readiness, and stored
 tracker/observation counts.
+
+The Settings page also reads Telegram's current webhook status: registered URL,
+pending update count and last delivery error. Enabling it registers only
+`message` updates with one delivery connection so commands remain ordered.
 
 ### Free-plan limits worth knowing
 
@@ -311,6 +331,13 @@ tracker/observation counts.
   centrally rather than per route.
 - Login throttling: 5 failures locks for 15 minutes. The throttle key is an
   HMAC of the client address, so raw IPs are never stored.
+- `/telegram/webhook` is POST-only, accepts at most 64 KiB of uncompressed JSON,
+  and compares Telegram's `X-Telegram-Bot-Api-Secret-Token` header in constant
+  time. Only `TELEGRAM_CHAT_ID` in a private chat is authorised; every other
+  update is silently ignored.
+- Telegram update state is persisted before replies are sent. A transient
+  webhook retry can resend the prepared reply but cannot rerun `/check`, pause,
+  or resume. Processed update rows are pruned after 30 days.
 - `Content-Security-Policy`, `X-Frame-Options: DENY`, `nosniff`,
   `Referrer-Policy: same-origin`, `Cache-Control: no-store`, `noindex`.
 - No Cloudflare account id, database id, API key, bot token, password hash or
