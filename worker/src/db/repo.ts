@@ -710,6 +710,22 @@ export class Repo {
       .run();
   }
 
+  /**
+   * Drop cron_runs older than `before`.
+   *
+   * At the 15-minute Cron cadence this table gains ~96 rows a day and is the
+   * only one in the schema that grows without a tracker or an observation
+   * behind it. Nothing reads a run older than the operator's memory of it, so
+   * the history is bounded here rather than left to fill the database.
+   */
+  async pruneCronRuns(before: Date): Promise<number> {
+    const result = await this.db
+      .prepare("DELETE FROM cron_runs WHERE started_at < ?")
+      .bind(toIso(before))
+      .run();
+    return result.meta.changes ?? 0;
+  }
+
   async recentCronRuns(limit = 10): Promise<CronRunRow[]> {
     const result = await this.db
       .prepare("SELECT * FROM cron_runs ORDER BY started_at DESC LIMIT ?")

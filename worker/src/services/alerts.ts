@@ -24,7 +24,7 @@ import {
   type ThresholdBasisValue,
 } from "../domain/enums.js";
 import { buildAlertText, type AlertContext } from "./messages.js";
-import type { TelegramNotifier } from "./telegram.js";
+import type { TelegramResult } from "./telegram.js";
 import { nowIso, parseIsoOrNull, toIso } from "../time.js";
 
 /** Delivery attempts per alert before it is left as failed for the operator. */
@@ -43,9 +43,26 @@ export interface AlertOutcome {
   eventId: number | null;
 }
 
+/**
+ * The slice of the Telegram client this service uses.
+ *
+ * `TelegramNotifier` satisfies it structurally, so nothing changes at the call
+ * sites; declaring it here is what lets a test hand in a two-method fake and
+ * assert on what would have been sent without a mocking library, a network
+ * stub, or any risk of a real message reaching a real person.
+ */
+export interface AlertNotifier {
+  isConfigured(): boolean;
+  sendMessage(
+    chatId: string | number,
+    text: string,
+    options?: { disablePreview?: boolean },
+  ): Promise<TelegramResult>;
+}
+
 export interface AlertDeps {
   repo: Repo;
-  notifier: TelegramNotifier;
+  notifier: AlertNotifier;
   timeZone: string;
 }
 
@@ -281,6 +298,26 @@ export class AlertService {
     chatId: string | null;
   }): Promise<AlertOutcome> {
     return this.handleOne({ ...args, alertType: AlertType.APPROACHING, suppressReason: null });
+  }
+
+  /**
+   * Send a message about the tracker itself rather than about a fare.
+   *
+   * No alert_events row is written: these notices are operational, they carry
+   * no dedupe key and no delivery history worth retrying, and the caller
+   * decides when one is warranted. It never throws -- the search that triggered
+   * it has already persisted everything that matters, and a Telegram outage
+   * must not turn a stored price into an exception.
+   */
+  async sendOperationalNotice(chatId: string | null, text: string): Promise<boolean> {
+    const { notifier } = this.deps;
+    if (chatId === null || chatId === "" || !notifier.isConfigured()) return false;
+    try {
+      const result = await notifier.sendMessage(chatId, text, { disablePreview: true });
+      return result.ok;
+    } catch {
+      return false;
+    }
   }
 
   /** Re-attempt alerts that failed with a retryable error. */
