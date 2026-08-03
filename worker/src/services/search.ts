@@ -46,9 +46,10 @@ import type {
   ProviderResult,
 } from "../providers/types.js";
 import { makeParty } from "../providers/types.js";
-import { addSeconds, nowIso, todayIn, toIso } from "../time.js";
+import { addMinutes, addSeconds, nowIso, todayIn, toIso } from "../time.js";
 import { AlertService, type CoverageInfo } from "./alerts.js";
 import { QuotaManager } from "./quota.js";
+import { escapeHtml } from "./telegram.js";
 import { ensureConfigVersion, payingTravelersOf, scheduleNextRun } from "./tracker.js";
 import type { CheckOutcome } from "../scheduled.js";
 
@@ -56,6 +57,19 @@ import type { CheckOutcome } from "../scheduled.js";
 const MAX_STORED_OFFERS = 25;
 /** Consecutive provider failures before a tracker is parked in the error state. */
 const FAILURE_LIMIT = 5;
+/**
+ * How soon a scan that ran out of budget comes back for the rest of its work.
+ *
+ * The Cron Trigger fires at minutes 7, 22, 37 and 52 -- every 15 minutes. A
+ * 16-minute gap therefore always lands strictly inside the following tick's
+ * window: exactly one tick is skipped, never two, and the resumption cannot
+ * race the tick that clamped the scan in the first place. Rescheduling a full
+ * check interval instead (12 hours by default) would make a window that plans
+ * ten date pairs but is clamped to three take days to complete one sweep,
+ * which is neither what the form's budget estimate promises nor what a
+ * traveler watching a window would expect.
+ */
+const RESUME_MINUTES = 16;
 
 interface QueryUnit {
   market: string;
@@ -667,15 +681,22 @@ export class SearchService {
       // Nothing observed. Failures were already counted per unit; park the
       // tracker only after a sustained run of them.
       if (result.providerFailures > 0 && tracker.consecutive_failures >= FAILURE_LIMIT) {
+        // Only the transition is announced. A tracker already parked that
+        // fails again must stay silent, or a permanently invalid key would
+        // message the owner on every tick -- and deploying this must send
+        // nothing at all, because nothing is transitioning.
+        const wasParked = tracker.status === TrackerStatus.ERROR;
         await repo.updateTrackerFields(tracker.id, { status: TrackerStatus.ERROR });
+        tracker.status = TrackerStatus.ERROR;
+        if (!wasParked) await this.announceParked(tracker, result);
       }
-      await scheduleNextRun(repo, tracker);
+      await this.scheduleFollowUp(tracker, result);
       return;
     }
 
     const observation = await repo.getObservation(this.bestObservationId);
     if (observation === null) {
-      await scheduleNextRun(repo, tracker);
+      await this.scheduleFollowUp(tracker, result);
       return;
     }
 
@@ -762,8 +783,67 @@ export class SearchService {
       if (outcome.state === DeliveryState.FAILED) result.telegramFailures += 1;
     }
 
-    await scheduleNextRun(repo, tracker);
+    await this.scheduleFollowUp(tracker, result);
     void series;
+  }
+
+  /**
+   * Decide when this tracker is next due.
+   *
+   * A scan the tick clamped has planned work it never reached, so it comes
+   * back on the next Cron tick rather than waiting out a whole check interval;
+   * anything else keeps the interval the owner configured. `scheduleNextRun`
+   * is deliberately left alone: its contract is "one configured interval from
+   * now, floored at 15 minutes", and bending it here would change what it
+   * means everywhere else it is called.
+   */
+  private async scheduleFollowUp(
+    tracker: TrackerWithMarkets,
+    result: CheckResult,
+  ): Promise<void> {
+    const { repo } = this.deps;
+    if (!result.workRemaining) {
+      await scheduleNextRun(repo, tracker);
+      return;
+    }
+    const at = toIso(addMinutes(new Date(), RESUME_MINUTES));
+    await repo.updateTrackerFields(tracker.id, { next_run_at: at });
+    tracker.next_run_at = at;
+  }
+
+  /**
+   * Tell the owner, once, that a tracker has stopped checking itself.
+   *
+   * Without this the tracker goes quiet and the silence is indistinguishable
+   * from "no fare moved" -- which is how a broken key stayed unnoticed for
+   * days. It is deliberately not an alert_events row: it is a statement about
+   * the tracker, not a finding about a fare, and the transition guard above is
+   * its deduplication.
+   */
+  private async announceParked(
+    tracker: TrackerWithMarkets,
+    result: CheckResult,
+  ): Promise<void> {
+    // This run's own last failure, not the tracker row: `executeLive` writes
+    // the message to D1 without refreshing the in-memory copy, which would
+    // otherwise make the notice quote whatever was there when the check began.
+    const reason =
+      result.errors[result.errors.length - 1] ??
+      tracker.last_error_message ??
+      tracker.last_error_category ??
+      "no detail recorded";
+    const text =
+      `⚠️ Tracker paused after ${FAILURE_LIMIT} consecutive failed checks — ` +
+      `${escapeHtml(tracker.name)} ` +
+      `(${escapeHtml(tracker.origin)}→${escapeHtml(tracker.destination)}).\n\n` +
+      `Last error: ${escapeHtml(reason)}\n\n` +
+      "FlightNotify will not spend more searches on it until it is edited or resumed.";
+
+    const sent = await this.deps.alerts.sendOperationalNotice(this.deps.chatId, text);
+    // Counted even when Telegram is simply unconfigured: unlike a fare alert,
+    // this notice leaves no row behind, so the tick's failure count is the
+    // only trace that the owner was never told.
+    if (!sent) result.telegramFailures += 1;
   }
 
   private async coverageFor(tracker: TrackerWithMarkets): Promise<CoverageInfo> {

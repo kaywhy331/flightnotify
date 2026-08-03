@@ -7,6 +7,10 @@
  * be wrapped in `raw()` explicitly.
  */
 
+// The generated asset module has no imports of its own, so pulling the content
+// hashes in here cannot create a cycle. They version the asset URLs below.
+import { APP_CSS_ETAG, APP_JS_ETAG } from "./static-assets.js";
+
 export class SafeHtml {
   constructor(readonly value: string) {}
   toString(): string {
@@ -76,6 +80,10 @@ export function layout(options: LayoutOptions, content: SafeHtml): SafeHtml {
       `
     : raw("");
 
+  // Both asset URLs carry `?v=<content hash>`. An ETag alone was not enough:
+  // Cloudflare's edge kept serving the previous stylesheet for the whole
+  // max-age after a deploy, which is exactly what was observed in production.
+  // A changed asset is now a changed URL, so a deploy is visible immediately.
   return html`<!doctype html>
 <html lang="en">
 <head>
@@ -83,7 +91,7 @@ export function layout(options: LayoutOptions, content: SafeHtml): SafeHtml {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
   <title>${title} · FlightNotify</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v=${APP_CSS_ETAG}">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>%E2%9C%88</text></svg>">
 </head>
 <body>
@@ -120,7 +128,7 @@ export function layout(options: LayoutOptions, content: SafeHtml): SafeHtml {
   </p>
 </footer>
 
-<script src="/static/app.js" defer></script>
+<script src="/static/app.js?v=${APP_JS_ETAG}" defer></script>
 </body>
 </html>`;
 }

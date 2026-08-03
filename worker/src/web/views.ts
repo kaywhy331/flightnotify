@@ -7,14 +7,16 @@
  * live regions, and labelled form controls.
  */
 
-import type {
-  AlertEventRow,
-  CronRunRow,
-  FareObservationRow,
-  FlexibleDateCandidateRow,
-  SearchRunRow,
-  TrackerWithMarkets,
+import {
+  parseJsonColumn,
+  type AlertEventRow,
+  type CronRunRow,
+  type FareObservationRow,
+  type FlexibleDateCandidateRow,
+  type SearchRunRow,
+  type TrackerWithMarkets,
 } from "../db/rows.js";
+import type { OfferLayover, OfferSegment } from "../providers/types.js";
 import {
   ALERT_TYPE_LABELS,
   CABIN_LABELS,
@@ -202,6 +204,8 @@ export function dashboardPage(args: {
       ${trackers.length === 0 ? emptyTrackers() : trackerTable(trackers, tz, args.sparklines)}
     </section>
 
+    ${recentAlertsCard(args.recentAlerts, trackers, tz)}
+
     <section class="card" aria-labelledby="ops-heading">
       <details ${raw(healthy ? "" : "open")}>
         <summary>
@@ -284,6 +288,73 @@ export function dashboardPage(args: {
       </details>
     </section>
   `;
+}
+
+/**
+ * What was actually said, and to whom it got through.
+ *
+ * The dashboard already fetched these; showing them answers "did FlightNotify
+ * message me and I missed it?" without opening each tracker in turn. Absent
+ * entirely when there is nothing to show, so a quiet deployment is not given a
+ * permanently empty table.
+ */
+function recentAlertsCard(
+  alerts: AlertEventRow[],
+  trackers: TrackerWithMarkets[],
+  tz: string,
+): SafeHtml {
+  if (alerts.length === 0) return raw("");
+  const byId = new Map(trackers.map((t) => [t.id, t]));
+
+  return html`
+    <section class="card" aria-labelledby="recent-alerts-heading">
+      <div class="card-head"><h2 id="recent-alerts-heading">Recent alerts</h2></div>
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">When</th>
+            <th scope="col">Tracker</th>
+            <th scope="col">Type</th>
+            <th scope="col">Delivery</th>
+            <th scope="col">Message</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${alerts.map((a) => {
+            // A tracker can be deleted while its alert history is kept, so the
+            // row has to survive the lookup failing rather than omit the alert.
+            const tracker = a.tracker_id === null ? undefined : byId.get(a.tracker_id);
+            return html`
+              <tr>
+                <td class="nowrap small">${formatLocal(a.created_at, tz)}</td>
+                <td>
+                  ${tracker
+                    ? html`<a href="/trackers/${tracker.id}">${tracker.name}</a>`
+                    : html`<span class="muted">deleted tracker</span>`}
+                </td>
+                <td class="small">${ALERT_TYPE_LABELS[a.alert_type] ?? a.alert_type}</td>
+                <td class="small">
+                  ${DELIVERY_STATE_LABELS[a.delivery_state] ?? a.delivery_state}
+                </td>
+                <td class="small detail-col">${firstLine(a.message_text)}</td>
+              </tr>
+            `;
+          })}
+        </tbody>
+      </table>
+    </section>
+  `;
+}
+
+/**
+ * The opening line of an alert body, cut to a width a table row can hold.
+ *
+ * The stored text is Telegram HTML, so it goes through the escaping template
+ * like any other string: the tags are shown, never rendered.
+ */
+function firstLine(text: string, limit = 80): string {
+  const line = (text.split("\n")[0] ?? "").trim();
+  return line.length > limit ? `${line.slice(0, limit - 1)}…` : line;
 }
 
 function emptyTrackers(): SafeHtml {
@@ -521,6 +592,7 @@ export function trackerDetailPage(args: {
                   <th scope="col" class="num">Stops</th>
                   <th scope="col">Dates</th>
                   <th scope="col">Market</th>
+                  <th scope="col">Itinerary</th>
                   <th scope="col"><span class="visually-hidden">Booking link</span></th>
                 </tr>
               </thead>
@@ -536,6 +608,7 @@ export function trackerDetailPage(args: {
                         ${formatDateShort(o.outbound_date)} – ${formatDateShort(o.return_date)}
                       </td>
                       <td class="small">${o.market}</td>
+                      <td class="small itinerary-col">${itineraryDetails(o)}</td>
                       <td class="small">
                         ${(() => {
                           const link = safeHttpsLink(o.booking_link ?? o.search_link);
@@ -731,6 +804,93 @@ function cheapestDatesCard(
           `}
     </section>
   `;
+}
+
+/**
+ * The itinerary an observation already stored but never showed.
+ *
+ * Every field here is optional in practice -- the provider omits some of them,
+ * and rows imported from the Python app predate others -- so nothing is
+ * assumed present and a row with no itinerary detail renders as nothing at all
+ * rather than as an empty disclosure. A native `<details>` keeps the table
+ * scannable without any JavaScript.
+ */
+function itineraryDetails(o: FareObservationRow): SafeHtml {
+  const segments = jsonArray<OfferSegment>(o.segments);
+  const layovers = jsonArray<OfferLayover>(o.layovers);
+  const total = formatFlightDuration(o.duration_minutes);
+  const hasTimes = Boolean(o.departure_time || o.arrival_time);
+
+  if (!hasTimes && total === null && segments.length === 0 && layovers.length === 0) {
+    return raw("");
+  }
+
+  const headline = [
+    hasTimes ? `${o.departure_time ?? "?"} → ${o.arrival_time ?? "?"}` : null,
+    total,
+  ].filter(isNonEmpty);
+
+  return html`
+    <details class="itinerary">
+      <summary>Details</summary>
+      ${headline.length > 0 ? html`<div class="itinerary-head">${headline.join(" · ")}</div>` : raw("")}
+      ${segments.length > 0
+        ? html`<ul class="itinerary-lines">
+            ${segments.map((s) => html`<li>${segmentLine(s)}</li>`)}
+          </ul>`
+        : raw("")}
+      ${layovers.length > 0
+        ? html`<ul class="itinerary-lines">
+            ${layovers.map((l) => html`<li>${layoverLine(l)}</li>`)}
+          </ul>`
+        : raw("")}
+    </details>
+  `;
+}
+
+/** A stored JSON column that should hold a list; anything else reads as empty. */
+function jsonArray<T>(json: string | null): T[] {
+  const parsed = parseJsonColumn<unknown>(json);
+  return Array.isArray(parsed) ? (parsed as T[]) : [];
+}
+
+function isNonEmpty(value: string | null | undefined): value is string {
+  return typeof value === "string" && value.trim() !== "";
+}
+
+/** One flight leg on one line, built from whichever fields the provider gave. */
+function segmentLine(segment: OfferSegment): string {
+  const carrier = [segment.airline, segment.flight_number].filter(isNonEmpty).join(" ");
+  const route = [segment.departure_id, segment.arrival_id].filter(isNonEmpty).join(" → ");
+  const times = [segment.departure_time, segment.arrival_time].filter(isNonEmpty).join(" → ");
+  const parts = [carrier, route, times].filter(isNonEmpty);
+  const duration = formatFlightDuration(segment.duration_minutes);
+  if (duration !== null) parts.push(duration);
+  if (segment.overnight) parts.push("overnight");
+  return parts.length > 0 ? parts.join(" · ") : "Flight segment (no detail recorded)";
+}
+
+function layoverLine(layover: OfferLayover): string {
+  const where = [layover.name, layover.id].find(isNonEmpty) ?? "unknown airport";
+  const duration = formatFlightDuration(layover.duration_minutes);
+  return (
+    `Layover: ${where}` +
+    (duration === null ? "" : ` (${duration})`) +
+    (layover.overnight ? " · overnight" : "")
+  );
+}
+
+/**
+ * Flight durations as "11h 25m". `humanizeDuration` is for schedule intervals
+ * and would render the same value as "11.4 hours", which is not how anyone
+ * reads a flight time.
+ */
+function formatFlightDuration(minutes: number | null | undefined): string | null {
+  if (typeof minutes !== "number" || !Number.isFinite(minutes) || minutes <= 0) return null;
+  const whole = Math.round(minutes);
+  const hours = Math.floor(whole / 60);
+  const rest = whole % 60;
+  return hours === 0 ? `${rest}m` : `${hours}h ${rest}m`;
 }
 
 function safeList(json: string | null): string {

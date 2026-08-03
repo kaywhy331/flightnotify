@@ -24,6 +24,9 @@ import type { TrackerWithMarkets } from "./db/rows.js";
 import { RunTrigger } from "./domain/enums.js";
 import { nowIso } from "./time.js";
 
+/** How much Cron history is kept. Long enough to diagnose last month's tick. */
+const CRON_RUN_RETENTION_DAYS = 30;
+
 export interface CheckOutcome {
   providerCalls: number;
   providerFailures: number;
@@ -216,6 +219,18 @@ export async function runScheduledTick(
         report.telegramFailures += 1;
         report.detail = report.detail || describeError(error);
       }
+    }
+
+    // Housekeeping, once per tick: cron_runs is the only fast-growing table.
+    // Wrapped because a tick that checked trackers and sent alerts must not be
+    // reported as failed just because a DELETE did not land.
+    try {
+      await repo.pruneCronRuns(
+        new Date(now.getTime() - CRON_RUN_RETENTION_DAYS * 24 * 60 * 60 * 1000),
+      );
+    } catch {
+      // Intentionally silent: the next tick tries again, and nothing downstream
+      // depends on the old rows being gone.
     }
 
     await repo.recordSweepState(report.outcome === "completed" ? "complete" : report.outcome);

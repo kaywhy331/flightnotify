@@ -493,3 +493,13 @@ dialog::backdrop { background: rgba(20, 24, 31, .45); }
 .card > details[open] > summary { margin-bottom: 0.75rem; }
 
 svg.sparkline { vertical-align: middle; }
+
+/* ------------------------------------------------- itinerary disclosure */
+/* Segments and layovers are stored on every observation; a native details
+   element shows them per row without JavaScript and without widening the
+   table for the rows nobody expands. */
+details.itinerary > summary { cursor: pointer; color: var(--accent); }
+details.itinerary[open] > summary { margin-bottom: .3rem; }
+.itinerary-head { color: var(--text-muted); }
+.itinerary-lines { margin: .2rem 0 0; padding: 0; list-style: none; }
+.itinerary-lines li { padding: .08rem 0; overflow-wrap: anywhere; }

@@ -199,7 +199,11 @@ function staticAsset(request: Request, body: string, contentType: string, etag: 
     headers: {
       "Content-Type": contentType,
       ETag: tag,
-      "Cache-Control": "public, max-age=3600",
+      // A day is safe because the layout links these with a `?v=<hash>` of
+      // their own contents: a changed asset is a changed URL, so nothing has
+      // to expire for a deploy to be picked up. The path match ignores the
+      // query string, so the cached copy is still one object per asset.
+      "Cache-Control": "public, max-age=86400",
       "X-Content-Type-Options": "nosniff",
     },
   });
