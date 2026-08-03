@@ -452,7 +452,7 @@ def test_excluded_tables_and_rows_never_reach_the_sql(source_db, tmp_path, capsy
     sql = output.read_text()
     out = capsys.readouterr().out
     # Everything after the header comment block is the statement body.
-    statements = "\n".join(l for l in sql.splitlines() if not l.startswith("--"))
+    statements = "\n".join(line for line in sql.splitlines() if not line.startswith("--"))
 
     assert 'INSERT INTO "query_cache"' not in sql
     assert 'INSERT INTO "scheduler_state"' not in sql

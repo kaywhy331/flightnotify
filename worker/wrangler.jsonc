@@ -17,7 +17,7 @@
       // Filled in locally from `npx wrangler d1 create flightnotify`. The
       // committed value is the placeholder; the real id is account-specific,
       // so keep it out of version control unless you decide otherwise.
-      "database_id": "PLACEHOLDER_D1_DATABASE_ID",
+      "database_id": "3fdfa515-ccdc-4048-800f-940fc6662d09",
       "migrations_dir": "migrations"
     }
   ],
