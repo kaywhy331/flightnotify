@@ -125,6 +125,18 @@ function windowForm(csrf: string): FormData {
   return form;
 }
 
+/** 3 departure days x 3 return days = 9 date pairs. */
+function returnWindowForm(csrf: string): FormData {
+  const form = baseForm(csrf);
+  form.set("date_mode", "custom_window");
+  form.set("window_outbound_start", futureDate(60));
+  form.set("window_outbound_end", futureDate(62));
+  form.set("window_return_start", futureDate(68));
+  form.set("window_return_end", futureDate(70));
+  form.set("candidates_per_run", "2");
+  return form;
+}
+
 async function post(path: string, cookie: string, form: FormData, e: Env = testEnv()) {
   return handleRequest(
     new Request(`${BASE}${path}`, { method: "POST", body: form, headers: { Cookie: cookie } }),
@@ -277,6 +289,67 @@ describe("creating trackers", () => {
     expect(tracker?.current_config_version_id).not.toBeNull();
   });
 
+  it("creates a return-date window without requiring a nights range", async () => {
+    const cookie = await signIn();
+    const csrf = await csrfFrom(cookie, "/trackers/new");
+    const response = await post("/trackers", cookie, returnWindowForm(csrf));
+    expect(response.status).toBe(303);
+
+    const repo = new Repo(env.DB);
+    const [tracker] = await repo.listTrackers();
+    expect(tracker?.window_return_start).toBe(futureDate(68));
+    expect(tracker?.window_return_end).toBe(futureDate(70));
+    expect(tracker?.min_nights).toBeNull();
+    expect(tracker?.max_nights).toBeNull();
+
+    const candidates = await env.DB.prepare(
+      "SELECT outbound_date, return_date FROM flexible_date_candidates ORDER BY order_index",
+    ).all<{ outbound_date: string; return_date: string }>();
+    expect(candidates.results).toHaveLength(9);
+    expect(
+      candidates.results.every(
+        (pair) => pair.return_date >= futureDate(68) && pair.return_date <= futureDate(70),
+      ),
+    ).toBe(true);
+  });
+
+  it("uses a nights range to filter an explicit return window", async () => {
+    const cookie = await signIn();
+    const csrf = await csrfFrom(cookie, "/trackers/new");
+    const form = returnWindowForm(csrf);
+    form.set("window_return_start", futureDate(65));
+    form.set("min_nights", "5");
+    form.set("max_nights", "6");
+
+    const response = await post("/trackers", cookie, form);
+    expect(response.status).toBe(303);
+    const candidates = await env.DB.prepare(
+      "SELECT nights FROM flexible_date_candidates ORDER BY order_index",
+    ).all<{ nights: number }>();
+    expect(candidates.results).toHaveLength(6);
+    expect(candidates.results.every((pair) => pair.nights === 5 || pair.nights === 6)).toBe(true);
+  });
+
+  it("rejects incomplete or reversed return windows", async () => {
+    const cookie = await signIn();
+    const csrf = await csrfFrom(cookie, "/trackers/new");
+    const incomplete = returnWindowForm(csrf);
+    incomplete.delete("window_return_end");
+
+    const missing = await post("/trackers", cookie, incomplete);
+    expect(missing.status).toBe(422);
+    expect(await missing.text()).toMatch(/both the earliest and latest return dates/);
+    expect(await new Repo(env.DB).listTrackers()).toHaveLength(0);
+
+    const nextCsrf = await csrfFrom(cookie, "/trackers/new");
+    const reversed = returnWindowForm(nextCsrf);
+    reversed.set("window_return_start", futureDate(72));
+    const invalid = await post("/trackers", cookie, reversed);
+    expect(invalid.status).toBe(422);
+    expect(await invalid.text()).toMatch(/return window ends before it starts/);
+    expect(await new Repo(env.DB).listTrackers()).toHaveLength(0);
+  });
+
   it("rejects an inverted trip-length range and writes nothing", async () => {
     const cookie = await signIn();
     const csrf = await csrfFrom(cookie, "/trackers/new");
@@ -427,6 +500,26 @@ describe("editing between date modes", () => {
     expect(html).toMatch(/name="min_nights"[^>]*value="5"/);
     expect(html).toMatch(/name="max_nights"[^>]*value="7"/);
     expect(html).toMatch(/id="mode-custom_window"[^>]*checked/);
+  });
+
+  it("round-trips a stored return window back into the edit form", async () => {
+    const id = await create(returnWindowForm);
+    const cookie = await signIn();
+    const html = await (
+      await handleRequest(
+        new Request(`${BASE}/trackers/${id}/edit`, { headers: { Cookie: cookie } }),
+        testEnv(),
+      )
+    ).text();
+
+    expect(html).toMatch(
+      new RegExp(`name="window_return_start"[^>]*value="${futureDate(68)}"`),
+    );
+    expect(html).toMatch(
+      new RegExp(`name="window_return_end"[^>]*value="${futureDate(70)}"`),
+    );
+    expect(html).toMatch(/name="min_nights"[^>]*value=""/);
+    expect(html).toMatch(/name="max_nights"[^>]*value=""/);
   });
 
   it("rebuilds the queue when the window changes", async () => {

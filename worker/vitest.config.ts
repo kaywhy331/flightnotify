@@ -5,7 +5,7 @@ import { defineConfig } from "vitest/config";
 // the workers pool in vitest.workers.config.ts.
 export default defineConfig({
   test: {
-    include: ["test/**/*.test.ts"],
+    include: ["test/**/*.test.ts", "test/**/*.test.js"],
     exclude: ["test/workers/**"],
   },
   resolve: {

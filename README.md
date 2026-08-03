@@ -356,10 +356,12 @@ is retried up to 3 times, after which the alert is left as failed and surfaced b
 |---|---|---|
 | **Exact dates** | 1 search per market | You know your dates. |
 | **Flexible preset** | 1 search per market | A month plus a trip length (weekend / ~1 week / ~2 weeks), via Google Travel Explore. |
-| **Custom flexible window** | 1 per date combination checked | You have a date range and a nights range. |
+| **Custom flexible window** | 1 per date combination checked | You have departure/return ranges, a nights range, or both. |
 
-A custom window can expand into many date combinations — far more than a free plan can check at
-once. FlightNotify handles this by checking `candidates_per_run` combinations per scan and
+A custom window accepts either an explicit return-date window or minimum/maximum nights. Supplying
+both uses the nights range to filter the return window. It can expand into many date combinations —
+far more than a free plan can check at once. FlightNotify handles this by checking
+`candidates_per_run` combinations per scan and
 rotating through the rest across subsequent scans, reporting coverage as partial until a full
 cycle completes. The form shows you the full-cycle cost before you save, and sampled mode
 requires an explicit acknowledgement so it cannot be entered by accident.

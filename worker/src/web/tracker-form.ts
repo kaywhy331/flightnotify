@@ -73,6 +73,8 @@ const VALUE_KEYS = [
   "flex_duration",
   "window_outbound_start",
   "window_outbound_end",
+  "window_return_start",
+  "window_return_end",
   "min_nights",
   "max_nights",
   "threshold_amount",
@@ -259,15 +261,43 @@ export function parseTrackerForm(
   } else if (dateMode === DateMode.CUSTOM_WINDOW) {
     const start = values["window_outbound_start"]!;
     const end = values["window_outbound_end"]!;
-    const minNights = values["min_nights"] === "" ? null : intOr(values["min_nights"]!, -1);
-    const maxNights = values["max_nights"] === "" ? null : intOr(values["max_nights"]!, -1);
+    const returnStart = values["window_return_start"]!;
+    const returnEnd = values["window_return_end"]!;
+    const minRaw = values["min_nights"]!;
+    const maxRaw = values["max_nights"]!;
+    const hasReturnStart = returnStart !== "";
+    const hasReturnEnd = returnEnd !== "";
+    const hasMinNights = minRaw !== "";
+    const hasMaxNights = maxRaw !== "";
+    const hasReturnWindow = hasReturnStart && hasReturnEnd;
+    const hasNightsRange = hasMinNights && hasMaxNights;
+    const minNights = hasMinNights ? intOr(minRaw, -1) : null;
+    const maxNights = hasMaxNights ? intOr(maxRaw, -1) : null;
 
     if (!DATE_RE.test(start)) errors["window_outbound_start"] = "Choose the earliest departure.";
     if (!DATE_RE.test(end)) errors["window_outbound_end"] = "Choose the latest departure.";
-    if (minNights === null || minNights < 1) {
+    if (hasReturnStart && !DATE_RE.test(returnStart)) {
+      errors["window_return_start"] = "Choose a valid earliest return date.";
+    }
+    if (hasReturnEnd && !DATE_RE.test(returnEnd)) {
+      errors["window_return_end"] = "Choose a valid latest return date.";
+    }
+    if (hasReturnStart !== hasReturnEnd) {
+      errors[hasReturnStart ? "window_return_end" : "window_return_start"] =
+        "Choose both the earliest and latest return dates.";
+    }
+    if (hasMinNights !== hasMaxNights) {
+      errors[hasMinNights ? "max_nights" : "min_nights"] =
+        "Enter both the minimum and maximum trip length.";
+    }
+    if (!hasReturnStart && !hasReturnEnd && !hasMinNights && !hasMaxNights) {
+      errors["window_return_start"] =
+        "Give either a return date window or a minimum and maximum trip length.";
+    }
+    if (minNights !== null && minNights < 1) {
       errors["min_nights"] = "Enter a minimum trip length of at least 1 night.";
     }
-    if (maxNights === null || maxNights < 1) {
+    if (maxNights !== null && maxNights < 1) {
       errors["max_nights"] = "Enter a maximum trip length of at least 1 night.";
     }
     if (
@@ -279,10 +309,20 @@ export function parseTrackerForm(
     ) {
       errors["max_nights"] = "Maximum trip length is shorter than the minimum.";
     }
+    if (
+      hasReturnWindow &&
+      !errors["window_return_start"] &&
+      !errors["window_return_end"] &&
+      returnEnd < returnStart
+    ) {
+      errors["window_return_end"] = "The return window ends before it starts.";
+    }
 
     if (
       !errors["window_outbound_start"] &&
       !errors["window_outbound_end"] &&
+      !errors["window_return_start"] &&
+      !errors["window_return_end"] &&
       !errors["min_nights"] &&
       !errors["max_nights"]
     ) {
@@ -291,20 +331,25 @@ export function parseTrackerForm(
           generatePairs({
             outboundStart: start,
             outboundEnd: end,
-            minNights,
-            maxNights,
+            returnStart: hasReturnWindow ? returnStart : null,
+            returnEnd: hasReturnWindow ? returnEnd : null,
+            minNights: hasNightsRange ? minNights : null,
+            maxNights: hasNightsRange ? maxNights : null,
             notBefore: options.today,
           }),
         );
         dateFields["window_outbound_start"] = start;
         dateFields["window_outbound_end"] = end;
-        dateFields["min_nights"] = minNights;
-        dateFields["max_nights"] = maxNights;
+        dateFields["window_return_start"] = hasReturnWindow ? returnStart : null;
+        dateFields["window_return_end"] = hasReturnWindow ? returnEnd : null;
+        dateFields["min_nights"] = hasNightsRange ? minNights : null;
+        dateFields["max_nights"] = hasNightsRange ? maxNights : null;
       } catch (error) {
         const message =
           error instanceof DateWindowError ? error.message : "That window is not usable.";
         // Attach to the field the operator can most usefully change.
         if (/trip length/i.test(message)) errors["max_nights"] = message;
+        else if (/return/i.test(message)) errors["window_return_end"] = message;
         else errors["window_outbound_end"] = message;
       }
     }
@@ -416,6 +461,8 @@ export function valuesFromTracker(tracker: Record<string, unknown>): Record<stri
     "flex_duration",
     "window_outbound_start",
     "window_outbound_end",
+    "window_return_start",
+    "window_return_end",
     "min_nights",
     "max_nights",
     "threshold_basis",
