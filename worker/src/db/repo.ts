@@ -27,6 +27,7 @@ import {
   type ProviderUsageRow,
   type SchedulerStateRow,
   type SearchRunRow,
+  type TelegramUpdateRow,
   type TrackerConfigVersionRow,
   type TrackerRow,
   type TrackerWithMarkets,
@@ -634,6 +635,81 @@ export class Repo {
       )
       .bind(key, JSON.stringify(value), nowIso())
       .run();
+  }
+
+  // ----------------------------------------------------- Telegram webhook
+  async telegramUpdate(updateId: number): Promise<TelegramUpdateRow | null> {
+    return guard("telegramUpdate", () =>
+      this.db
+        .prepare("SELECT * FROM telegram_updates WHERE update_id = ?")
+        .bind(updateId)
+        .first<TelegramUpdateRow>(),
+    );
+  }
+
+  /**
+   * Claim one Telegram update exactly once.
+   *
+   * `INSERT OR IGNORE` is the concurrency primitive: only the invocation whose
+   * insert changes a row is allowed to execute the command. A retry reads the
+   * persisted state and either resends the prepared reply or stops immediately.
+   */
+  async claimTelegramUpdate(
+    updateId: number,
+    now: Date = new Date(),
+  ): Promise<{ claimed: boolean; row: TelegramUpdateRow }> {
+    return guard("claimTelegramUpdate", async () => {
+      const at = toIso(now);
+      const result = await this.db
+        .prepare(
+          `INSERT OR IGNORE INTO telegram_updates
+             (update_id, state, received_at, updated_at)
+           VALUES (?1, 'processing', ?2, ?2)`,
+        )
+        .bind(updateId, at)
+        .run();
+      const row = await this.db
+        .prepare("SELECT * FROM telegram_updates WHERE update_id = ?")
+        .bind(updateId)
+        .first<TelegramUpdateRow>();
+      if (!row) throw new Error("claimed Telegram update was not readable");
+      return { claimed: (result.meta.changes ?? 0) > 0, row };
+    });
+  }
+
+  async updateTelegramUpdate(
+    updateId: number,
+    fields: Partial<
+      Pick<
+        TelegramUpdateRow,
+        "state" | "chat_id" | "command" | "reply_text" | "delivery_attempts" | "last_error"
+      >
+    >,
+  ): Promise<void> {
+    const keys = Object.keys(fields);
+    if (keys.length === 0) return;
+    await guard("updateTelegramUpdate", () =>
+      this.db
+        .prepare(
+          `UPDATE telegram_updates
+              SET ${keys.map((key, index) => `${key} = ?${index + 2}`).join(", ")},
+                  updated_at = ?${keys.length + 2}
+            WHERE update_id = ?1`,
+        )
+        .bind(
+          updateId,
+          ...keys.map((key) => fields[key as keyof typeof fields] as never),
+          nowIso(),
+        )
+        .run(),
+    );
+  }
+
+  async pruneTelegramUpdates(before: Date): Promise<number> {
+    const result = await guard("pruneTelegramUpdates", () =>
+      this.db.prepare("DELETE FROM telegram_updates WHERE updated_at < ?").bind(toIso(before)).run(),
+    );
+    return result.meta.changes ?? 0;
   }
 
   // ------------------------------------------------------- scheduler lease

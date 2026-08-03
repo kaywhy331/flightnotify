@@ -69,6 +69,15 @@ export interface BotIdentity {
   readonly handle: string;
 }
 
+export interface TelegramWebhookInfo {
+  readonly url: string;
+  readonly pendingUpdateCount: number;
+  readonly lastErrorDate: number | null;
+  readonly lastErrorMessage: string | null;
+  readonly maxConnections: number | null;
+  readonly allowedUpdates: string[];
+}
+
 /** The slice of `Config` this client needs; `Config` satisfies it structurally. */
 export interface TelegramConfig {
   readonly telegramBotToken: string;
@@ -303,6 +312,90 @@ export class TelegramNotifier {
       userMessage: "Message delivered.",
       meta: { chatId: isRecord(chat) ? (chat["id"] ?? null) : null },
     });
+  }
+
+  /** Register the single-user command webhook with Telegram. */
+  async setWebhook(url: string, secret: string): Promise<TelegramResult> {
+    if (!url.startsWith("https://")) {
+      return makeResult({
+        ok: false,
+        category: "error",
+        userMessage: "Telegram requires an HTTPS webhook URL.",
+      });
+    }
+    if (secret.length < 32 || secret.length > 256 || !/^[A-Za-z0-9_-]+$/.test(secret)) {
+      return makeResult({
+        ok: false,
+        category: "error",
+        userMessage: "The Telegram webhook secret is missing or invalid.",
+      });
+    }
+    const result = await this.call("setWebhook", {
+      url,
+      secret_token: secret,
+      // One connection preserves update order and keeps a single-user bot from
+      // executing two state-changing commands concurrently.
+      max_connections: 1,
+      allowed_updates: '["message"]',
+    });
+    if (!result.ok) return result;
+    return makeResult({
+      ok: true,
+      category: "ok",
+      userMessage: "Telegram command webhook enabled.",
+      meta: result.meta,
+    });
+  }
+
+  async deleteWebhook(): Promise<TelegramResult> {
+    const result = await this.call("deleteWebhook", { drop_pending_updates: false });
+    if (!result.ok) return result;
+    return makeResult({
+      ok: true,
+      category: "ok",
+      userMessage: "Telegram command webhook disabled.",
+      meta: result.meta,
+    });
+  }
+
+  async getWebhookInfo(): Promise<{
+    info: TelegramWebhookInfo | null;
+    result: TelegramResult;
+  }> {
+    const result = await this.call("getWebhookInfo", {});
+    if (!result.ok) return { info: null, result };
+    const payload = isRecord(result.meta["result"]) ? result.meta["result"] : {};
+    const allowed = Array.isArray(payload["allowed_updates"])
+      ? payload["allowed_updates"].filter((item): item is string => typeof item === "string")
+      : [];
+    return {
+      info: {
+        url: typeof payload["url"] === "string" ? payload["url"] : "",
+        pendingUpdateCount:
+          typeof payload["pending_update_count"] === "number"
+            ? Math.trunc(payload["pending_update_count"])
+            : 0,
+        lastErrorDate:
+          typeof payload["last_error_date"] === "number"
+            ? Math.trunc(payload["last_error_date"])
+            : null,
+        lastErrorMessage:
+          typeof payload["last_error_message"] === "string"
+            ? payload["last_error_message"]
+            : null,
+        maxConnections:
+          typeof payload["max_connections"] === "number"
+            ? Math.trunc(payload["max_connections"])
+            : null,
+        allowedUpdates: allowed,
+      },
+      result: makeResult({
+        ok: true,
+        category: "ok",
+        userMessage: "Telegram webhook status loaded.",
+        meta: result.meta,
+      }),
+    };
   }
 
   // -- transport ----------------------------------------------------------

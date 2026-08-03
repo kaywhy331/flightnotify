@@ -67,11 +67,7 @@ export async function constantTimeEqual(a: string, b: string): Promise<boolean> 
     crypto.subtle.digest("SHA-256", encoder.encode(a)),
     crypto.subtle.digest("SHA-256", encoder.encode(b)),
   ]);
-  const va = new Uint8Array(da);
-  const vb = new Uint8Array(db);
-  let diff = 0;
-  for (let i = 0; i < va.length; i += 1) diff |= va[i]! ^ vb[i]!;
-  return diff === 0;
+  return crypto.subtle.timingSafeEqual(da, db);
 }
 
 async function hmac(secret: string, message: string): Promise<string> {

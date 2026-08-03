@@ -24,6 +24,7 @@ export interface Env {
   SERPAPI_API_KEY?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_CHAT_ID?: string;
+  TELEGRAM_WEBHOOK_SECRET?: string;
   AUTH_PASSWORD_HASH?: string;
   SESSION_SECRET?: string;
 
@@ -66,6 +67,7 @@ export interface Config {
 
   telegramBotToken: string;
   telegramChatId: string;
+  telegramWebhookSecret: string;
   telegramBaseUrl: string;
 
   authPasswordHash: string;
@@ -230,6 +232,23 @@ export function loadConfig(env: Env): ConfigResult {
     });
   }
 
+  let telegramWebhookSecret = env.TELEGRAM_WEBHOOK_SECRET?.trim() ?? "";
+  if (
+    telegramWebhookSecret !== "" &&
+    (telegramWebhookSecret.length < 32 ||
+      telegramWebhookSecret.length > 256 ||
+      !/^[A-Za-z0-9_-]+$/.test(telegramWebhookSecret))
+  ) {
+    problems.push({
+      key: "TELEGRAM_WEBHOOK_SECRET",
+      detail:
+        "Invalid. Telegram command webhooks require 32-256 characters using only " +
+        "letters, numbers, underscore and hyphen. Alerts remain available; commands are disabled.",
+      blocking: false,
+    });
+    telegramWebhookSecret = "";
+  }
+
   const config: Config = {
     appTimezone,
     defaultCurrency: (env.DEFAULT_CURRENCY?.trim() || "USD").toUpperCase(),
@@ -246,6 +265,7 @@ export function loadConfig(env: Env): ConfigResult {
 
     telegramBotToken,
     telegramChatId,
+    telegramWebhookSecret,
     telegramBaseUrl: env.TELEGRAM_BASE_URL?.trim() || "https://api.telegram.org",
 
     authPasswordHash,

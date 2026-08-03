@@ -26,6 +26,7 @@ import { nowIso } from "./time.js";
 
 /** How much Cron history is kept. Long enough to diagnose last month's tick. */
 const CRON_RUN_RETENTION_DAYS = 30;
+const TELEGRAM_UPDATE_RETENTION_DAYS = 30;
 
 export interface CheckOutcome {
   providerCalls: number;
@@ -221,12 +222,16 @@ export async function runScheduledTick(
       }
     }
 
-    // Housekeeping, once per tick: cron_runs is the only fast-growing table.
+    // Housekeeping, once per tick: both operational histories are diagnostic,
+    // not permanent application data.
     // Wrapped because a tick that checked trackers and sent alerts must not be
     // reported as failed just because a DELETE did not land.
     try {
       await repo.pruneCronRuns(
         new Date(now.getTime() - CRON_RUN_RETENTION_DAYS * 24 * 60 * 60 * 1000),
+      );
+      await repo.pruneTelegramUpdates(
+        new Date(now.getTime() - TELEGRAM_UPDATE_RETENTION_DAYS * 24 * 60 * 60 * 1000),
       );
     } catch {
       // Intentionally silent: the next tick tries again, and nothing downstream
