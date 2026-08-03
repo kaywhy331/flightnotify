@@ -993,7 +993,7 @@ export function trackerFormPage(args: TrackerFormViewArgs): SafeHtml {
             [
               ["exact", "Exact dates", "One departure and one return."],
               ["flexible_preset", "Flexible preset", "A whole month and a trip length, in one provider call."],
-              ["custom_window", "Custom flexible window", "A departure range plus a trip-length range, swept across runs."],
+              ["custom_window", "Custom flexible window", "Departure and return ranges, swept across runs."],
             ] as [string, string, string][]
           ).map(
             ([value, label, hint]) => html`
@@ -1084,6 +1084,26 @@ export function trackerFormPage(args: TrackerFormViewArgs): SafeHtml {
                      min="${args.today}" value="${v("window_outbound_end")}"
                      ${invalid("window_outbound_end")}>
               ${err("window_outbound_end")}
+            </div>
+          </div>
+          <p class="hint small">
+            Set either a return window or a trip-length range. If you set both, the trip length
+            filters the return window.
+          </p>
+          <div class="inline-fields">
+            <div class="field">
+              <label for="window_return_start">Earliest return</label>
+              <input type="date" id="window_return_start" name="window_return_start"
+                     min="${args.today}" value="${v("window_return_start")}"
+                     ${invalid("window_return_start")}>
+              ${err("window_return_start")}
+            </div>
+            <div class="field">
+              <label for="window_return_end">Latest return</label>
+              <input type="date" id="window_return_end" name="window_return_end"
+                     min="${args.today}" value="${v("window_return_end")}"
+                     ${invalid("window_return_end")}>
+              ${err("window_return_end")}
             </div>
           </div>
           <div class="inline-fields">
