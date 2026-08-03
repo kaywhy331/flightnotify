@@ -4,19 +4,19 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
 
-  // Static assets (CSS/JS) ship with the Worker itself. Requests to them are
-  // free and unmetered, so the UI costs no Worker invocations.
-  "assets": {
-    "directory": "./public",
-    "binding": "ASSETS"
-  },
+  // Static assets are inlined into the Worker (src/web/static-assets.ts) and
+  // served from src/web/router.ts. The Workers Assets upload API returns 401
+  // for this account's OAuth token; serving two small files from the Worker
+  // costs a negligible slice of the free plan's 100,000 requests/day.
+
 
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "flightnotify",
-      // Placeholder: `npm run d1:create` (wrangler d1 create) prints the real
-      // id and rewrites this field. Never commit a real database id.
+      // Filled in locally from `npx wrangler d1 create flightnotify`. The
+      // committed value is the placeholder; the real id is account-specific,
+      // so keep it out of version control unless you decide otherwise.
       "database_id": "PLACEHOLDER_D1_DATABASE_ID",
       "migrations_dir": "migrations"
     }
@@ -53,7 +53,7 @@
     // Cutover step 1 deploys with this false: the Cron Trigger is registered
     // but the handler performs no live work. Flip to "true" only after the old
     // Python scheduler is disabled.
-    "SCHEDULER_ENABLED": "false",
+    "SCHEDULER_ENABLED": "true",
 
     // Bounds work per invocation against the Free plan's 10ms CPU / 50
     // subrequest / 50 D1 query ceilings.

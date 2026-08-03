@@ -7,13 +7,15 @@
     "dev": "wrangler dev",
     "typecheck": "wrangler types && tsc --noEmit",
     "test": "vitest run",
-    "build": "wrangler deploy --dry-run --outdir=dist",
+    "build": "node scripts/build-static.mjs && wrangler deploy --dry-run --outdir=dist",
     "migrate:local": "wrangler d1 migrations apply flightnotify --local",
     "migrate:remote": "wrangler d1 migrations apply flightnotify --remote",
     "test:workers": "vitest run --config vitest.workers.config.ts",
     "test:all": "vitest run && vitest run --config vitest.workers.config.ts",
     "types": "wrangler types",
-    "hash-password": "node scripts/hash-password.mjs"
+    "hash-password": "node scripts/hash-password.mjs",
+    "build:static": "node scripts/build-static.mjs",
+    "deploy": "node scripts/build-static.mjs && wrangler deploy"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.20.1",

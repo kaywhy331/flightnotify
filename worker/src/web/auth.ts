@@ -28,6 +28,20 @@ export const SESSION_TTL_SECONDS = 14 * 24 * 3600;
 const MAX_FAILURES = 5;
 const LOCKOUT_SECONDS = 15 * 60;
 
+/**
+ * The Workers runtime refuses PBKDF2 above 100,000 iterations:
+ *
+ *   NotSupportedError: Pbkdf2 failed: iteration counts above 100000 are not
+ *   supported (requested 210000).
+ *
+ * Node's WebCrypto has no such cap, so this only appears once deployed. The
+ * constant is exported and validated at config load, which turns a hash minted
+ * with a higher count into a precise setup message instead of a 500 on the
+ * login route.
+ */
+export const MAX_PBKDF2_ITERATIONS = 100_000;
+export const DEFAULT_PBKDF2_ITERATIONS = 100_000;
+
 const encoder = new TextEncoder();
 
 function base64UrlEncode(bytes: Uint8Array): string {
@@ -87,6 +101,7 @@ export function parsePasswordHash(stored: string): ParsedHash | null {
   if (scheme !== "pbkdf2" || digestName !== "sha256") return null;
   const iterations = Number(iterationsText);
   if (!Number.isInteger(iterations) || iterations < 1000) return null;
+  if (iterations > MAX_PBKDF2_ITERATIONS) return null;
   try {
     return {
       iterations,
@@ -119,7 +134,10 @@ export async function verifyPassword(password: string, stored: string): Promise<
 }
 
 /** Used by the `hash-password` script, and by tests to build fixtures. */
-export async function hashPassword(password: string, iterations = 210_000): Promise<string> {
+export async function hashPassword(
+  password: string,
+  iterations = DEFAULT_PBKDF2_ITERATIONS,
+): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const derived = await pbkdf2(password, salt, iterations, 256);
   return `pbkdf2$sha256$${iterations}$${base64UrlEncode(salt)}$${base64UrlEncode(derived)}`;

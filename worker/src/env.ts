@@ -13,6 +13,7 @@
  */
 
 import { PriceScopeLabel, type PriceScopeValue } from "./domain/enums.js";
+import { MAX_PBKDF2_ITERATIONS, parsePasswordHash } from "./web/auth.js";
 
 export interface Env {
   // --- bindings ----------------------------------------------------------
@@ -182,6 +183,18 @@ export function loadConfig(env: Env): ConfigResult {
       detail:
         "Not set, so no one could sign in. Generate one with `npm run hash-password` " +
         "and store it via `npx wrangler secret put AUTH_PASSWORD_HASH`.",
+      blocking: true,
+    });
+  } else if (parsePasswordHash(authPasswordHash) === null) {
+    // Checked here rather than at login: an unusable hash is a configuration
+    // fault, and surfacing it as "incorrect password" (or a 500) would send
+    // the operator hunting for the wrong problem.
+    problems.push({
+      key: "AUTH_PASSWORD_HASH",
+      detail:
+        "Not a usable hash. Expected pbkdf2$sha256$<iterations>$<salt>$<hash> with " +
+        `between 1000 and ${MAX_PBKDF2_ITERATIONS} iterations (the Workers runtime ` +
+        "rejects PBKDF2 above that). Regenerate it with `npm run hash-password`.",
       blocking: true,
     });
   }

@@ -63,6 +63,24 @@ Changed, and why:
 
 ---
 
+## 2a. Platform constraints found during the real cutover
+
+Four things behaved differently against Cloudflare than they did locally. Each
+is now enforced by a test or by config validation, but they are worth knowing
+before touching this again.
+
+| Constraint | Symptom | Resolution |
+| --- | --- | --- |
+| **PBKDF2 is capped at 100,000 iterations.** Node's WebCrypto has no such cap. | Every login returned 500: `NotSupportedError: Pbkdf2 failed: iteration counts above 100000 are not supported (requested 210000)`. Node-only tests were green. | `DEFAULT_PBKDF2_ITERATIONS = 100_000`; `loadConfig` rejects an out-of-range hash as a *blocking config problem* with a precise message rather than failing at login. Auth tests now run in the workers pool (`test/workers/auth.test.ts`) so the real runtime validates them. |
+| **The Workers Assets upload API returned 401** for this account's OAuth token, while the Worker upload itself succeeded. | `POST /accounts/…/workers/assets/upload → 401`, deploy aborted. | The stylesheet and script are inlined into the Worker (`scripts/build-static.mjs` → `src/web/static-assets.ts`) and served from the router with an ETag. Same deployment, ~23 KB, negligible against 100,000 requests/day. If you later re-authorise with the assets scope, the binding can be restored. |
+| **D1 rejects SQL-level transactions.** | Import failed: *"please use the state.storage.transaction() … APIs instead of the SQL BEGIN TRANSACTION or SAVEPOINT statements."* | The exporter emits no `BEGIN`/`COMMIT`; `wrangler d1 execute --file` applies the file as one batch. A test asserts the generated SQL contains no transaction statements. |
+| **D1 limits terms in a compound SELECT.** | A 12-way `UNION ALL` count query returned `too many terms in compound SELECT [code: 7500]`. | Only affects ad-hoc verification queries; split them. Application queries never use compound SELECTs. |
+
+A fifth, milder one: a key defined in `wrangler.jsonc` `vars` takes precedence
+over `.dev.vars` locally — see [Local development](#4-local-development).
+
+---
+
 ## 3. One-time setup
 
 ```bash

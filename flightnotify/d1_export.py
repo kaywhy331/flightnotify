@@ -797,7 +797,12 @@ def render_sql(result: ExportResult, *, generated_at: datetime | None = None) ->
     ]
     lines += [f"--   {item}" for item in result.exclusions]
     lines += [f"--   {item}" for item in result.repaired_references]
-    lines += ["", "BEGIN TRANSACTION;"]
+    # Deliberately no BEGIN TRANSACTION / COMMIT. D1 rejects them outright:
+    # "To execute a transaction, please use the state.storage.transaction()
+    # ... APIs instead of the SQL BEGIN TRANSACTION or SAVEPOINT statements."
+    # `wrangler d1 execute --file` applies the file as one batch, so the
+    # atomicity the explicit transaction was there for is still provided.
+    lines += [""]
 
     for table in result.tables:
         lines.append("")
@@ -811,7 +816,7 @@ def render_sql(result: ExportResult, *, generated_at: datetime | None = None) ->
             values = ", ".join(sql_literal(row[name]) for name in table.spec.target_columns)
             lines.append(f"{prefix}({values});")
 
-    lines += ["", "COMMIT;", ""]
+    lines += [""]
     return "\n".join(lines)
 
 

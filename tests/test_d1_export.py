@@ -451,7 +451,8 @@ def test_excluded_tables_and_rows_never_reach_the_sql(source_db, tmp_path, capsy
     assert export(source_db, output) == cli.EXIT_OK
     sql = output.read_text()
     out = capsys.readouterr().out
-    statements = sql.split("BEGIN TRANSACTION;", 1)[1]
+    # Everything after the header comment block is the statement body.
+    statements = "\n".join(l for l in sql.splitlines() if not l.startswith("--"))
 
     assert 'INSERT INTO "query_cache"' not in sql
     assert 'INSERT INTO "scheduler_state"' not in sql
@@ -527,8 +528,11 @@ def test_tables_are_emitted_in_foreign_key_order(source_db, tmp_path, capsys):
     ]
     positions = [sql.index(f'INSERT INTO "{name}" (') for name in order]
     assert positions == sorted(positions)
-    assert sql.index("BEGIN TRANSACTION;") < positions[0]
-    assert sql.rindex("COMMIT;") > positions[-1]
+    # D1 rejects SQL-level transactions outright, so the file must not
+    # contain them; `wrangler d1 execute --file` batches the statements.
+    assert "BEGIN TRANSACTION" not in sql
+    assert "COMMIT;" not in sql
+    assert "SAVEPOINT" not in sql
 
 
 def test_the_export_uses_explicit_column_lists_and_the_renamed_money_columns(

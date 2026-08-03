@@ -12,7 +12,9 @@
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 
-const ITERATIONS = 210_000;
+// The Workers runtime rejects PBKDF2 above 100,000 iterations, and the hash
+// has to be verifiable there, not just here.
+const ITERATIONS = 100_000;
 
 const b64url = (bytes) =>
   Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");

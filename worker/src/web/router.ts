@@ -36,6 +36,7 @@ import {
   verifySessionToken,
 } from "./auth.js";
 import { htmlResponse, layout, redirect, type Flash } from "./html.js";
+import { APP_CSS, APP_CSS_ETAG, APP_JS, APP_JS_ETAG } from "./static-assets.js";
 import {
   dashboardPage,
   errorPage,
@@ -62,6 +63,15 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
   if (url.pathname === "/healthz") {
     return healthz(env, usable);
+  }
+
+  // Served before the setup gate and before the session guard: a stylesheet is
+  // not private, and the setup page needs it to be legible.
+  if (url.pathname === "/static/app.css") {
+    return staticAsset(request, APP_CSS, "text/css; charset=utf-8", APP_CSS_ETAG);
+  }
+  if (url.pathname === "/static/app.js") {
+    return staticAsset(request, APP_JS, "text/javascript; charset=utf-8", APP_JS_ETAG);
   }
 
   if (!usable) {
@@ -169,6 +179,22 @@ async function loginRoute(
   await clearAuthFailures(repo, key);
   const token = await createSessionToken(config.sessionSecret);
   return redirect("/", { "Set-Cookie": sessionCookie(token, secure) });
+}
+
+/** Serve an inlined asset with an ETag so repeat loads are a 304. */
+function staticAsset(request: Request, body: string, contentType: string, etag: string): Response {
+  const tag = `"${etag}"`;
+  if (request.headers.get("If-None-Match") === tag) {
+    return new Response(null, { status: 304, headers: { ETag: tag } });
+  }
+  return new Response(body, {
+    headers: {
+      "Content-Type": contentType,
+      ETag: tag,
+      "Cache-Control": "public, max-age=3600",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
 }
 
 async function healthz(env: Env, usable: boolean): Promise<Response> {

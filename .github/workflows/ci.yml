@@ -107,6 +107,9 @@ jobs:
       - name: Generate binding types
         run: npx wrangler types
 
+      - name: Build static assets (generated module, not committed)
+        run: npm run build:static
+
       - name: Static types
         run: npx tsc --noEmit
 
@@ -131,7 +134,7 @@ jobs:
 
       - name: No placeholder or real credentials in the bundle
         run: |
-          # The database id stays a placeholder in the committed config, and no
+          # The committed config must not carry a real D1 database id, and no
           # secret may be inlined into the deployed script.
           grep -q 'PLACEHOLDER_D1_DATABASE_ID' wrangler.jsonc
           if grep -rniE 'serpapi_api_key["'"'"']?\s*[:=]\s*["'"'"'][a-f0-9]{32}' dist/; then
