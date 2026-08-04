@@ -249,6 +249,8 @@ rendered into templates, or logged — the logger redacts them by literal value.
 | `APP_TIMEZONE` | `America/Los_Angeles` | IANA zone for schedules and displayed times. |
 | `APP_HOST` / `APP_PORT` | `127.0.0.1` / `8000` | Listen address. |
 | `APP_SECRET_KEY` | *(generated)* | Signs session cookies and CSRF tokens. |
+| `APP_HTTPS_ONLY` | `false` | Mark cookies Secure and emit HSTS; enable behind trusted HTTPS only. |
+| `TRUSTED_PROXY_IPS` | `127.0.0.1` | Proxy addresses allowed to supply forwarded scheme/client headers. |
 | `DATABASE_URL` | `sqlite:///data/flightnotify.db` | SQLAlchemy URL. |
 | `DEFAULT_MARKET` / `DEFAULT_CURRENCY` | `us` / `USD` | Defaults for new trackers. |
 | `QUERY_CACHE_TTL_SECONDS` | `900` | How long an identical query is reused locally. |

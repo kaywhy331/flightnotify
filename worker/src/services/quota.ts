@@ -50,6 +50,16 @@ export interface SpendDecision {
   reason: string;
 }
 
+export interface QuotaReservation {
+  period: string;
+  hour: string;
+  reserved: number;
+}
+
+function hourKey(now: Date): string {
+  return now.toISOString().slice(0, 13);
+}
+
 export class QuotaManager {
   constructor(
     private readonly repo: Repo,
@@ -76,7 +86,11 @@ export class QuotaManager {
     remainingHard = Math.max(0, remainingHard);
 
     const remainingSafe = Math.max(0, remainingHard - reserve);
-    const hourlyRemaining = Math.max(0, this.config.hourlySearchLimit - hourlyUsed);
+    const hourlyLimit =
+      row.provider_rate_limit_per_hour === null
+        ? this.config.hourlySearchLimit
+        : Math.min(this.config.hourlySearchLimit, row.provider_rate_limit_per_hour);
+    const hourlyRemaining = Math.max(0, hourlyLimit - hourlyUsed);
 
     return {
       period,
@@ -91,7 +105,7 @@ export class QuotaManager {
       providerAccountMasked: row.provider_account_email_masked,
       lastSyncedAt: row.last_synced_at,
       syncError: row.last_sync_error,
-      hourlyLimit: this.config.hourlySearchLimit,
+      hourlyLimit,
       hourlyUsed,
       effectiveUsed,
       remainingHard,
@@ -104,6 +118,98 @@ export class QuotaManager {
       isExhausted: remainingHard <= 0,
       automationBlocked: remainingSafe <= 0,
     };
+  }
+
+  /**
+   * Reserve capacity before a provider request.
+   *
+   * Monthly and hourly counters each use an atomic conditional write.  They
+   * are deliberately conservative across the tiny gap between the two writes:
+   * a killed invocation can leave capacity reserved, but cannot spend an
+   * unreserved call.  Housekeeping/reconciliation can recover stale capacity;
+   * protecting the owner's paid allowance takes precedence over availability.
+   */
+  async reserveCalls(
+    count: number,
+    trigger: RunTriggerValue,
+    now = new Date(),
+  ): Promise<{ decision: SpendDecision; reservation: QuotaReservation | null }> {
+    if (count <= 0) {
+      return {
+        decision: { allowed: true, granted: 0, reason: "" },
+        reservation: { period: periodKey(now), hour: hourKey(now), reserved: 0 },
+      };
+    }
+
+    const period = periodKey(now);
+    const row = await this.repo.usageRow(period);
+    const mayUseReserve = RESERVE_ELIGIBLE.has(trigger);
+    const configuredLimit = mayUseReserve
+      ? this.config.monthlySearchBudget
+      : Math.max(0, this.config.monthlySearchBudget - this.config.reserveSearches);
+    const allowedLimit =
+      row.provider_searches_per_month === null
+        ? configuredLimit
+        : Math.min(configuredLimit, row.provider_searches_per_month);
+
+    if (!(await this.repo.reserveMonthlyCalls(period, count, allowedLimit))) {
+      const snapshot = await this.snapshot(now);
+      return {
+        reservation: null,
+        decision: {
+          allowed: false,
+          granted: 0,
+          reason:
+            snapshot.remainingHard <= 0
+              ? `Monthly provider allowance is exhausted (${snapshot.effectiveUsed}/${snapshot.monthlyLimit} used in ${snapshot.period}).`
+              : mayUseReserve
+                ? "The remaining provider allowance is smaller than this request's retry reservation."
+                : `Only the ${snapshot.reserve}-search reserve remains; automated checks are paused.`,
+        },
+      };
+    }
+
+    const providerHourly = row.provider_rate_limit_per_hour;
+    const hourlyLimit =
+      providerHourly === null
+        ? this.config.hourlySearchLimit
+        : Math.min(this.config.hourlySearchLimit, providerHourly);
+    const hour = hourKey(now);
+    if (!(await this.repo.reserveHourlyCalls(hour, count, hourlyLimit))) {
+      await this.repo.releaseMonthlyCalls(period, count);
+      return {
+        reservation: null,
+        decision: {
+          allowed: false,
+          granted: 0,
+          reason:
+            `The provider's hourly throughput limit (${hourlyLimit}/hour) is reached. ` +
+            "FlightNotify will resume on a later run.",
+        },
+      };
+    }
+
+    return {
+      decision: { allowed: true, granted: count, reason: "" },
+      reservation: { period, hour, reserved: count },
+    };
+  }
+
+  /** Reconcile a conservative reservation with the adapter's actual attempts. */
+  async finalizeReservation(
+    reservation: QuotaReservation,
+    endpoint: string,
+    runId: number | null,
+    actualCount: number,
+    now = new Date(),
+  ): Promise<void> {
+    const actual = Math.max(0, Math.min(reservation.reserved, Math.trunc(actualCount)));
+    const unused = reservation.reserved - actual;
+    if (unused > 0) {
+      await this.repo.releaseMonthlyCalls(reservation.period, unused);
+      await this.repo.releaseHourlyCalls(reservation.hour, unused);
+    }
+    await this.repo.insertProviderCallRows(endpoint, runId, actual, now.toISOString());
   }
 
   /** Decide how many of `wanted` billable calls may be made now. */

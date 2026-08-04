@@ -20,6 +20,7 @@ import type { OfferLayover, OfferSegment } from "../providers/types.js";
 import {
   ALERT_TYPE_LABELS,
   CABIN_LABELS,
+  DateMode,
   DATE_MODE_LABELS,
   DELIVERY_STATE_LABELS,
   FLEX_DURATION_LABELS,
@@ -122,7 +123,7 @@ function csrfField(token: string): SafeHtml {
 export function loginPage(args: { error?: string | null; tz: string }): SafeHtml {
   return html`
     <div class="page-head"><h1>Sign in</h1></div>
-    <div class="card" style="max-width: 26rem;">
+    <div class="card login-card">
       ${args.error
         ? html`<div class="notice notice-danger" role="alert">${args.error}</div>`
         : raw("")}
@@ -311,7 +312,7 @@ function recentAlertsCard(
   return html`
     <section class="card" aria-labelledby="recent-alerts-heading">
       <div class="card-head"><h2 id="recent-alerts-heading">Recent alerts</h2></div>
-      <table>
+      <table class="stacked">
         <thead>
           <tr>
             <th scope="col">When</th>
@@ -328,17 +329,17 @@ function recentAlertsCard(
             const tracker = a.tracker_id === null ? undefined : byId.get(a.tracker_id);
             return html`
               <tr>
-                <td class="nowrap small">${formatLocal(a.created_at, tz)}</td>
-                <td>
+                <td class="nowrap small" data-label="When">${formatLocal(a.created_at, tz)}</td>
+                <td data-label="Tracker">
                   ${tracker
                     ? html`<a href="/trackers/${tracker.id}">${tracker.name}</a>`
                     : html`<span class="muted">deleted tracker</span>`}
                 </td>
-                <td class="small">${ALERT_TYPE_LABELS[a.alert_type] ?? a.alert_type}</td>
-                <td class="small">
+                <td class="small" data-label="Type">${ALERT_TYPE_LABELS[a.alert_type] ?? a.alert_type}</td>
+                <td class="small" data-label="Delivery">
                   ${DELIVERY_STATE_LABELS[a.delivery_state] ?? a.delivery_state}
                 </td>
-                <td class="small detail-col">${firstLine(a.message_text)}</td>
+                <td class="small detail-col" data-label="Message">${firstLine(a.message_text)}</td>
               </tr>
             `;
           })}
@@ -374,7 +375,7 @@ function trackerTable(
   sparklines?: Map<number, { at: string; cents: number }[]>,
 ): SafeHtml {
   return html`
-    <table>
+    <table class="stacked">
       <thead>
         <tr>
           <th scope="col">Tracker</th>
@@ -392,20 +393,20 @@ function trackerTable(
         ${trackers.map(
           (t) => html`
             <tr>
-              <td><a href="/trackers/${t.id}">${t.name}</a></td>
-              <td class="nowrap">${t.origin} → ${t.destination}</td>
-              <td class="nowrap small">${describeDates(t)}</td>
-              <td class="num">${formatMoney(t.latest_price_cents, t.currency)}</td>
-              <td>${sparkline(sparklines?.get(t.id))}</td>
-              <td class="num">${formatMoney(t.low_price_cents, t.currency)}</td>
-              <td class="num">${formatMoney(t.threshold_amount_cents, t.currency)}</td>
-              <td class="nowrap small">
+              <td data-label="Tracker"><a href="/trackers/${t.id}">${t.name}</a></td>
+              <td class="nowrap" data-label="Route">${t.origin} → ${t.destination}</td>
+              <td class="nowrap small" data-label="Dates">${describeDates(t)}</td>
+              <td class="num" data-label="Latest">${formatMoney(t.latest_price_cents, t.currency)}</td>
+              <td data-label="Trend">${sparkline(sparklines?.get(t.id))}</td>
+              <td class="num" data-label="Observed low">${formatMoney(t.low_price_cents, t.currency)}</td>
+              <td class="num" data-label="Threshold">${formatMoney(t.threshold_amount_cents, t.currency)}</td>
+              <td class="nowrap small" data-label="Next check">
                 ${humanizeDelta(t.next_run_at)}
                 ${isOverdue(t)
                   ? html` <span class="badge badge-warning">overdue</span>`
                   : raw("")}
               </td>
-              <td>${statusBadge(t.status)}</td>
+              <td data-label="Status">${statusBadge(t.status)}</td>
             </tr>
           `,
         )}
@@ -460,6 +461,7 @@ export interface PriceContext {
 export function trackerDetailPage(args: {
   tracker: TrackerWithMarkets;
   observations: FareObservationRow[];
+  latestObservation?: FareObservationRow | null;
   runs: SearchRunRow[];
   alerts: AlertEventRow[];
   csrf: string;
@@ -470,11 +472,21 @@ export function trackerDetailPage(args: {
   chartSvg?: string | null;
   candidates?: FlexibleDateCandidateRow[];
   candidateCoverage?: { checked: number; total: number } | null;
+  historyPage?: number;
+  historyPageSize?: number;
+  historyTotal?: number;
+  maxProviderRequestsPerSearch?: number;
 }): SafeHtml {
   const { tracker: t, observations, runs, alerts, csrf, tz } = args;
-  const latest = observations[0];
+  const latest = args.latestObservation ?? observations[0];
   const latestLink = safeHttpsLink(latest?.booking_link ?? latest?.search_link);
   const completed = t.status === TrackerStatus.COMPLETED;
+  const marketsPerScan = Math.max(1, t.markets.length);
+  const pairsPerScan =
+    t.date_mode === DateMode.CUSTOM_WINDOW ? Math.max(1, t.candidates_per_run) : 1;
+  const plannedCallsPerScan = pairsPerScan * marketsPerScan;
+  const maxCallsPerScan =
+    plannedCallsPerScan * Math.max(1, args.maxProviderRequestsPerSearch ?? 1);
 
   return html`
     <div class="page-head">
@@ -485,17 +497,24 @@ export function trackerDetailPage(args: {
           ${csrfField(csrf)}
           <button class="btn btn-small" type="submit">Duplicate</button>
         </form>
-        <form method="post" action="/trackers/${t.id}/toggle" class="inline-fields">
-          ${csrfField(csrf)}
-          <button class="btn btn-small" type="submit">
-            ${t.status === TrackerStatus.PAUSED ? "Resume" : "Pause"}
-          </button>
-        </form>
-        <form method="post" action="/trackers/${t.id}/delete" class="inline-fields"
-              onsubmit="return confirm('Delete this tracker and its price history?')">
-          ${csrfField(csrf)}
-          <button class="btn btn-small btn-danger" type="submit">Delete</button>
-        </form>
+        ${completed
+          ? raw("")
+          : html`<form method="post" action="/trackers/${t.id}/toggle" class="inline-fields">
+              ${csrfField(csrf)}
+              <button class="btn btn-small" type="submit">
+                ${t.status === TrackerStatus.ACTIVE ? "Pause" : "Resume"}
+              </button>
+            </form>`}
+        <details class="delete-confirm">
+          <summary class="btn btn-small btn-danger">Delete</summary>
+          <div class="confirm-panel">
+            <p>Delete this tracker and all of its price history? This cannot be undone.</p>
+            <form method="post" action="/trackers/${t.id}/delete" class="btn-row">
+              ${csrfField(csrf)}
+              <button class="btn btn-small btn-danger" type="submit">Confirm delete</button>
+            </form>
+          </div>
+        </details>
       </div>
     </div>
 
@@ -569,7 +588,12 @@ export function trackerDetailPage(args: {
                   The provider allowance is exhausted, so a manual check is unavailable.
                 </span>`
               : html`<span class="hint small">
-                  Uses one provider search per market.
+                  A fresh scan plans <strong>${plannedCallsPerScan}</strong> provider search(es)
+                  (${pairsPerScan} date pair(s) × ${marketsPerScan} market(s)).
+                  ${maxCallsPerScan > plannedCallsPerScan
+                    ? html`It needs quota room for up to <strong>${maxCallsPerScan}</strong>
+                        provider calls in case bounded retries are needed.`
+                    : raw("")}
                   ${t.last_success_at
                     ? html` Last successful check ${humanizeDelta(t.last_success_at)}.`
                     : raw("")}
@@ -585,7 +609,7 @@ export function trackerDetailPage(args: {
       ${observations.length === 0
         ? html`<div class="empty-state"><p>No observations recorded yet.</p></div>`
         : html`
-            <table>
+            <table class="stacked">
               <thead>
                 <tr>
                   <th scope="col">Observed</th>
@@ -599,19 +623,19 @@ export function trackerDetailPage(args: {
                 </tr>
               </thead>
               <tbody>
-                ${observations.slice(0, 50).map(
+                ${observations.map(
                   (o) => html`
                     <tr>
-                      <td class="nowrap small">${formatLocal(o.observed_at, tz)}</td>
-                      <td class="num">${formatMoney(o.price_amount_cents, o.currency)}</td>
-                      <td class="small">${safeList(o.airlines)}</td>
-                      <td class="num">${o.stops ?? "-"}</td>
-                      <td class="nowrap small">
+                      <td class="nowrap small" data-label="Observed">${formatLocal(o.observed_at, tz)}</td>
+                      <td class="num" data-label="Price">${formatMoney(o.price_amount_cents, o.currency)}</td>
+                      <td class="small" data-label="Airlines">${safeList(o.airlines)}</td>
+                      <td class="num" data-label="Stops">${o.stops ?? "-"}</td>
+                      <td class="nowrap small" data-label="Dates">
                         ${formatDateShort(o.outbound_date)} – ${formatDateShort(o.return_date)}
                       </td>
-                      <td class="small">${o.market}</td>
-                      <td class="small itinerary-col">${itineraryDetails(o)}</td>
-                      <td class="small">
+                      <td class="small" data-label="Market">${o.market}</td>
+                      <td class="small itinerary-col" data-label="Itinerary">${itineraryDetails(o)}</td>
+                      <td class="small" data-label="Booking link">
                         ${(() => {
                           const link = safeHttpsLink(o.booking_link ?? o.search_link);
                           return link
@@ -625,6 +649,24 @@ export function trackerDetailPage(args: {
                 )}
               </tbody>
             </table>
+            ${(() => {
+              const page = args.historyPage ?? 1;
+              const size = args.historyPageSize ?? 50;
+              const total = args.historyTotal ?? observations.length;
+              if (total <= size) return raw("");
+              const maxPage = Math.max(1, Math.ceil(total / size));
+              return html`<nav class="pager" aria-label="Price history pages">
+                ${page > 1
+                  ? html`<a class="btn btn-small"
+                        href="/trackers/${t.id}?page=${page - 1}#history-heading">Newer</a>`
+                  : raw("")}
+                <span class="small muted">Page ${page} of ${maxPage} · ${total} observations</span>
+                ${page < maxPage
+                  ? html`<a class="btn btn-small"
+                        href="/trackers/${t.id}?page=${page + 1}#history-heading">Older</a>`
+                  : raw("")}
+              </nav>`;
+            })()}
           `}
     </section>
 
@@ -633,7 +675,7 @@ export function trackerDetailPage(args: {
       ${runs.length === 0
         ? html`<div class="empty-state"><p>No checks recorded yet.</p></div>`
         : html`
-            <table>
+            <table class="stacked">
               <thead>
                 <tr>
                   <th scope="col">Started</th>
@@ -647,11 +689,11 @@ export function trackerDetailPage(args: {
                 ${runs.map(
                   (r) => html`
                     <tr>
-                      <td class="nowrap small">${formatLocal(r.started_at, tz)}</td>
-                      <td class="small">${r.trigger}</td>
-                      <td class="small">${RUN_STATUS_LABELS[r.status] ?? r.status}</td>
-                      <td class="num">${r.offers_found}</td>
-                      <td class="small">${r.error_message ?? r.skip_reason ?? ""}</td>
+                      <td class="nowrap small" data-label="Started">${formatLocal(r.started_at, tz)}</td>
+                      <td class="small" data-label="Trigger">${r.trigger}</td>
+                      <td class="small" data-label="Status">${RUN_STATUS_LABELS[r.status] ?? r.status}</td>
+                      <td class="num" data-label="Offers">${r.offers_found}</td>
+                      <td class="small" data-label="Detail">${r.error_message ?? r.skip_reason ?? ""}</td>
                     </tr>
                   `,
                 )}
@@ -665,7 +707,7 @@ export function trackerDetailPage(args: {
       ${alerts.length === 0
         ? html`<div class="empty-state"><p>No alerts recorded yet.</p></div>`
         : html`
-            <table>
+            <table class="stacked">
               <thead>
                 <tr>
                   <th scope="col">Created</th>
@@ -678,12 +720,12 @@ export function trackerDetailPage(args: {
                 ${alerts.map(
                   (a) => html`
                     <tr>
-                      <td class="nowrap small">${formatLocal(a.created_at, tz)}</td>
-                      <td class="small">${ALERT_TYPE_LABELS[a.alert_type] ?? a.alert_type}</td>
-                      <td class="small">
+                      <td class="nowrap small" data-label="Created">${formatLocal(a.created_at, tz)}</td>
+                      <td class="small" data-label="Type">${ALERT_TYPE_LABELS[a.alert_type] ?? a.alert_type}</td>
+                      <td class="small" data-label="Delivery">
                         ${DELIVERY_STATE_LABELS[a.delivery_state] ?? a.delivery_state}
                       </td>
-                      <td class="small">${a.last_error ?? ""}</td>
+                      <td class="small" data-label="Detail">${a.last_error ?? ""}</td>
                     </tr>
                   `,
                 )}
@@ -772,7 +814,7 @@ function cheapestDatesCard(
             sweep works through the window.</p>
           </div>`
         : html`
-            <table>
+            <table class="stacked">
               <thead>
                 <tr>
                   <th scope="col">Depart</th>
@@ -786,14 +828,14 @@ function cheapestDatesCard(
                 ${candidates.map(
                   (c, index) => html`
                     <tr>
-                      <td class="nowrap">${formatDateShort(c.outbound_date)}
+                      <td class="nowrap" data-label="Depart">${formatDateShort(c.outbound_date)}
                         ${index === 0
                           ? html` <span class="badge badge-ok">cheapest</span>`
                           : raw("")}</td>
-                      <td class="nowrap">${formatDateShort(c.return_date)}</td>
-                      <td class="num">${c.nights}</td>
-                      <td class="num">${formatMoney(c.last_price_cents, t.currency)}</td>
-                      <td class="nowrap small">${humanizeDelta(c.last_checked_at)}</td>
+                      <td class="nowrap" data-label="Return">${formatDateShort(c.return_date)}</td>
+                      <td class="num" data-label="Nights">${c.nights}</td>
+                      <td class="num" data-label="Last seen price">${formatMoney(c.last_price_cents, t.currency)}</td>
+                      <td class="nowrap small" data-label="Checked">${humanizeDelta(c.last_checked_at)}</td>
                     </tr>
                   `,
                 )}
@@ -1122,7 +1164,7 @@ export function trackerFormPage(args: TrackerFormViewArgs): SafeHtml {
             <div class="field">
               <label for="candidates_per_run">Date pairs checked per run</label>
               <input type="number" id="candidates_per_run" name="candidates_per_run" min="1"
-                     max="20" value="${v("candidates_per_run", "1")}">
+                     max="10" value="${v("candidates_per_run", "1")}">
               <p class="hint small">
                 Each pair costs one provider search per market. A sweep resumes where the last
                 run stopped.
@@ -1342,15 +1384,21 @@ function budgetBox(budget: FormBudget | null): SafeHtml {
       <p class="headline">${verdict.headline}</p>
       <p>${verdict.detail}</p>
       <p class="small">
-        Per scan: <strong>${est.callsPerScan}</strong> provider search(es)
-        (${budget.candidateCount > 0 ? budget.candidateCount : 1} date pair(s)
+        Per scan: <strong>${est.callsPerScan}</strong> planned provider search(es)
+        (${budget.candidatesPerScan} date pair(s)
         × ${budget.marketCount} market(s)).
+        ${est.maxCallsPerScan > est.callsPerScan
+          ? html`Retry safety requires quota room for up to
+              <strong>${est.maxCallsPerScan}</strong> calls.`
+          : raw("")}
       </p>
       ${budget.candidateCount > 0
         ? html`<p class="small">
             Date combinations in this window: <strong>${budget.candidateCount}</strong>.
             A full sweep takes ${est.scansPerFullCycle} scans
-            (${est.callsPerFullCycle} searches, about ${humanizeDuration(est.fullCycleMinutes)}).
+            (${est.callsPerFullCycle} planned searches,
+            up to ${est.maxCallsPerFullCycle} calls with retries,
+            about ${humanizeDuration(est.fullCycleMinutes)}).
           </p>`
         : raw("")}
       ${verdict.suggestions.length > 0
@@ -1499,16 +1547,16 @@ export function settingsPage(args: {
         : raw("")}
       ${args.discovered && args.discovered.length > 0
         ? html`
-            <table>
+            <table class="stacked">
               <thead>
                 <tr><th scope="col">Chat id</th><th scope="col">Name</th><th scope="col">Last message</th></tr>
               </thead>
               <tbody>
                 ${args.discovered.map(
                   (c) => html`<tr>
-                    <td class="mono">${c.chatId}</td>
-                    <td>${c.displayName}</td>
-                    <td class="small">${c.lastText ?? ""}</td>
+                    <td class="mono" data-label="Chat id">${c.chatId}</td>
+                    <td data-label="Name">${c.displayName}</td>
+                    <td class="small" data-label="Last message">${c.lastText ?? ""}</td>
                   </tr>`,
                 )}
               </tbody>
@@ -1526,10 +1574,10 @@ export function settingsPage(args: {
       ${q
         ? html`
             <div class="budget-box">
-              <div class="progress" role="img"
-                   aria-label="${q.usedPercent}% of the monthly allowance used">
-                <span style="width: ${Math.min(100, q.usedPercent)}%"></span>
-              </div>
+              <progress class="progress" value="${Math.min(100, q.usedPercent)}" max="100"
+                        aria-label="${q.usedPercent}% of the monthly allowance used">
+                ${q.usedPercent}%
+              </progress>
               <dl class="kv">
                 <dt>Period</dt><dd>${q.period}</dd>
                 <dt>Used</dt><dd>${q.effectiveUsed} of ${q.monthlyLimit}</dd>
@@ -1537,10 +1585,23 @@ export function settingsPage(args: {
                 <dt>Reserved for manual checks</dt>
                 <dd>${q.reserve} (${q.reservePercent}%)</dd>
                 <dt>This hour</dt><dd>${q.hourlyUsed} of ${q.hourlyLimit}</dd>
+                <dt>Provider plan</dt><dd>${q.providerPlan ?? "Not synced"}</dd>
+                <dt>Provider account</dt><dd>${q.providerAccountMasked ?? "Not synced"}</dd>
+                <dt>Last provider sync</dt><dd>${formatLocal(q.lastSyncedAt, args.tz)}</dd>
+                ${q.syncError
+                  ? html`<dt>Sync error</dt><dd class="error-text">${q.syncError}</dd>`
+                  : raw("")}
               </dl>
             </div>
           `
         : html`<p class="muted">Quota data is unavailable.</p>`}
+      <form method="post" action="/settings/sync-provider" class="btn-row">
+        ${csrfField(csrf)}
+        <button class="btn" type="submit" ${raw(status.serpapiConfigured ? "" : "disabled")}>
+          Refresh provider allowance
+        </button>
+        <span class="hint small">Account-status reads do not consume fare-search quota.</span>
+      </form>
     </section>
 
     <section class="card" aria-labelledby="ops2-heading">
@@ -1558,6 +1619,22 @@ export function settingsPage(args: {
             : "None recorded."}
         </dd>
       </dl>
+    </section>
+
+    <section class="card" aria-labelledby="sessions-heading">
+      <div class="card-head"><h2 id="sessions-heading">Sessions</h2></div>
+      <p>
+        Sign out every browser that is currently authenticated. You will need to sign in again
+        on this device too.
+      </p>
+      <form method="post" action="/settings/revoke-sessions" class="btn-row">
+        ${csrfField(csrf)}
+        <button class="btn btn-danger" type="submit">Revoke all sessions</button>
+      </form>
+      <p class="hint small">
+        To change the password, generate a new hash with <code>npm run hash-password</code>,
+        replace the <code>AUTH_PASSWORD_HASH</code> Worker secret, and redeploy.
+      </p>
     </section>
   `;
 }

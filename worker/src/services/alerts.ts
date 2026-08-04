@@ -12,7 +12,7 @@
  */
 
 import type { Repo } from "../db/repo.js";
-import type { FareObservationRow, TrackerWithMarkets } from "../db/rows.js";
+import type { AlertEventRow, FareObservationRow, TrackerWithMarkets } from "../db/rows.js";
 import type { Evaluation } from "../domain/evaluation.js";
 import { alertDedupeKey } from "../domain/fingerprints.js";
 import {
@@ -25,10 +25,11 @@ import {
 } from "../domain/enums.js";
 import { buildAlertText, type AlertContext } from "./messages.js";
 import type { TelegramResult } from "./telegram.js";
-import { nowIso, parseIsoOrNull, toIso } from "../time.js";
+import { addSeconds, nowIso, parseIsoOrNull, toIso } from "../time.js";
 
 /** Delivery attempts per alert before it is left as failed for the operator. */
 export const MAX_DELIVERY_ATTEMPTS = 3;
+const DELIVERY_CLAIM_TTL_SECONDS = 60;
 
 export interface CoverageInfo {
   checked: number | null;
@@ -132,6 +133,8 @@ export class AlertService {
   }): Promise<AlertOutcome> {
     const { tracker, observation, evaluation, coverage, chatId, alertType } = args;
     const { repo, notifier, timeZone } = this.deps;
+    const owner = `alert:${crypto.randomUUID()}`;
+    const claimedAt = new Date();
 
     const dedupeKey = await alertDedupeKey({
       tracker_id: tracker.id,
@@ -190,8 +193,14 @@ export class AlertService {
       alert_type: alertType,
       dedupe_key: dedupeKey,
       message_text: message,
-      delivery_state: DeliveryState.PENDING,
-      created_at: nowIso(),
+      // The INSERT is both dedupe and delivery claim. A retry sweep can never
+      // take this row between creation and the cooldown/configuration checks.
+      delivery_state: DeliveryState.SENDING,
+      attempts: 1,
+      retryable: 0,
+      claim_owner: owner,
+      claim_expires_at: toIso(addSeconds(claimedAt, DELIVERY_CLAIM_TTL_SECONDS)),
+      created_at: toIso(claimedAt),
     });
 
     if (eventId === null) {
@@ -205,8 +214,10 @@ export class AlertService {
     }
 
     if (args.suppressReason) {
-      await repo.updateAlertEvent(eventId, {
+      await repo.completeAlertClaim(eventId, owner, {
         delivery_state: DeliveryState.SUPPRESSED_DUPLICATE,
+        retryable: 0,
+        next_attempt_at: null,
         last_error: args.suppressReason,
       });
       return {
@@ -219,8 +230,10 @@ export class AlertService {
 
     const cooldown = await this.cooldownReason(tracker, alertType, eventId);
     if (cooldown) {
-      await repo.updateAlertEvent(eventId, {
+      await repo.completeAlertClaim(eventId, owner, {
         delivery_state: DeliveryState.SUPPRESSED_COOLDOWN,
+        retryable: 0,
+        next_attempt_at: null,
         last_error: cooldown,
       });
       return { alertType, state: DeliveryState.SUPPRESSED_COOLDOWN, detail: cooldown, eventId };
@@ -230,14 +243,20 @@ export class AlertService {
       const detail =
         "Telegram is not configured. The alert is recorded here; set TELEGRAM_BOT_TOKEN " +
         "and TELEGRAM_CHAT_ID as Worker secrets to receive messages.";
-      await repo.updateAlertEvent(eventId, {
+      await repo.completeAlertClaim(eventId, owner, {
         delivery_state: DeliveryState.NOT_CONFIGURED,
+        retryable: 0,
+        next_attempt_at: null,
         last_error: detail,
       });
       return { alertType, state: DeliveryState.NOT_CONFIGURED, detail, eventId };
     }
 
-    const delivered = await this.deliver(eventId, message, 0, chatId);
+    const delivered = await this.deliverClaimed(
+      { id: eventId, message_text: message, attempts: 1 },
+      owner,
+      chatId,
+    );
     return {
       alertType,
       state: delivered.state,
@@ -246,41 +265,78 @@ export class AlertService {
     };
   }
 
-  private async deliver(
-    eventId: number,
-    message: string,
-    priorAttempts: number,
+  private async deliverClaimed(
+    event: Pick<AlertEventRow, "id" | "message_text" | "attempts">,
+    owner: string,
     chatId: string,
   ): Promise<{ state: DeliveryStateValue; detail: string }> {
     const { repo, notifier } = this.deps;
-    const attempts = priorAttempts + 1;
-    const result = await notifier.sendMessage(chatId, message, { disablePreview: false });
+    let result: TelegramResult;
+    try {
+      result = await notifier.sendMessage(chatId, event.message_text, { disablePreview: false });
+    } catch (error) {
+      const label = error instanceof Error ? error.name : "Error";
+      const detail =
+        `Telegram delivery ended without a response (${label}). It may have succeeded, ` +
+        "so FlightNotify will not automatically send a duplicate.";
+      await repo.completeAlertClaim(event.id, owner, {
+        delivery_state: DeliveryState.UNCERTAIN,
+        retryable: 0,
+        next_attempt_at: null,
+        last_error: detail,
+        response_meta: JSON.stringify({ category: "transport_exception", attempts: event.attempts }),
+      });
+      return { state: DeliveryState.UNCERTAIN, detail };
+    }
 
     if (result.ok) {
-      await repo.updateAlertEvent(eventId, {
+      const recorded = await repo.completeAlertClaim(event.id, owner, {
         delivery_state: DeliveryState.SENT,
         delivered_at: nowIso(),
         telegram_message_id: result.messageId ?? null,
-        attempts,
+        retryable: 0,
+        next_attempt_at: null,
         last_error: null,
         response_meta: JSON.stringify({ message_id: result.messageId ?? null }),
       });
+      if (!recorded) {
+        return {
+          state: DeliveryState.UNCERTAIN,
+          detail: "Telegram accepted the message, but the delivery claim expired before confirmation was stored.",
+        };
+      }
       return { state: DeliveryState.SENT, detail: "Alert delivered." };
     }
 
-    await repo.updateAlertEvent(eventId, {
-      delivery_state: DeliveryState.FAILED,
-      attempts,
-      last_error: result.userMessage,
+    const ambiguous =
+      result.category === "timeout" ||
+      result.category === "network" ||
+      result.category === "ambiguous_response";
+    const mayRetry = result.retryable && !ambiguous && event.attempts < MAX_DELIVERY_ATTEMPTS;
+    const delaySeconds = Math.min(
+      3600,
+      Math.max(result.retryAfter ?? 0, 30 * 2 ** Math.max(0, event.attempts - 1)),
+    );
+    const detail = ambiguous
+      ? result.userMessage ||
+        "Telegram delivery may have succeeded, so it was not automatically retried."
+      : result.userMessage || "Delivery failed.";
+    const state = ambiguous ? DeliveryState.UNCERTAIN : DeliveryState.FAILED;
+    await repo.completeAlertClaim(event.id, owner, {
+      delivery_state: state,
+      retryable: mayRetry ? 1 : 0,
+      next_attempt_at: mayRetry ? toIso(addSeconds(new Date(), delaySeconds)) : null,
+      last_error: detail,
       response_meta: JSON.stringify({
         category: result.category,
         error_code: result.errorCode ?? null,
         retry_after: result.retryAfter ?? null,
-        retryable: result.retryable,
-        attempts,
+        retryable: mayRetry,
+        ambiguous,
+        attempts: event.attempts,
       }),
     });
-    return { state: DeliveryState.FAILED, detail: result.userMessage || "Delivery failed." };
+    return { state, detail };
   }
 
   /**
@@ -325,13 +381,20 @@ export class AlertService {
     chatId: string | null,
     limit = 20,
   ): Promise<{ delivered: number; failed: number }> {
+    await this.deps.repo.markExpiredAlertClaimsUncertain();
     if (!chatId || !this.deps.notifier.isConfigured()) return { delivered: 0, failed: 0 };
 
-    const events = await this.deps.repo.pendingAlerts(MAX_DELIVERY_ATTEMPTS, limit);
+    const owner = `alert-retry:${crypto.randomUUID()}`;
+    const events = await this.deps.repo.claimPendingAlerts(
+      owner,
+      MAX_DELIVERY_ATTEMPTS,
+      limit,
+      DELIVERY_CLAIM_TTL_SECONDS,
+    );
     let delivered = 0;
     let failed = 0;
     for (const event of events) {
-      const outcome = await this.deliver(event.id, event.message_text, event.attempts, chatId);
+      const outcome = await this.deliverClaimed(event, owner, chatId);
       if (outcome.state === DeliveryState.SENT) delivered += 1;
       else failed += 1;
     }

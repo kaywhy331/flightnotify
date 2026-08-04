@@ -10,7 +10,7 @@ import { loadConfig, type Env } from "./env.js";
 import { Repo } from "./db/repo.js";
 import { runScheduledTick } from "./scheduled.js";
 import { maybeSendWeeklyDigest } from "./services/digest.js";
-import { handleRequest, servicesFor } from "./web/router.js";
+import { handleRequest, hardenResponse, servicesFor } from "./web/router.js";
 import { htmlResponse, layout } from "./web/html.js";
 import { errorPage } from "./web/views.js";
 
@@ -30,7 +30,7 @@ export default {
         }),
       );
       const { config } = loadConfig(env);
-      return htmlResponse(
+      return hardenResponse(request, htmlResponse(
         layout(
           {
             title: "Something went wrong",
@@ -46,7 +46,7 @@ export default {
           }),
         ),
         { status: 500 },
-      );
+      ));
     }
   },
 

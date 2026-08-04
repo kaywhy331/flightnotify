@@ -105,6 +105,9 @@ export interface SeriesChange {
 export async function ensureConfigVersion(
   repo: Repo,
   tracker: TrackerWithMarkets,
+  options: {
+    candidates?: { outbound: string; ret: string; nights: number }[];
+  } = {},
 ): Promise<SeriesChange> {
   const payload = comparisonPayload(tracker);
   const fingerprint = await configFingerprint(payload);
@@ -115,6 +118,23 @@ export async function ensureConfigVersion(
       await repo.updateTrackerFields(tracker.id, { current_config_version_id: latest.id });
       tracker.current_config_version_id = latest.id;
     }
+    if (options.candidates !== undefined) {
+      const existing = await repo.candidateDefinitions(latest.id);
+      const intended = options.candidates;
+      const matches =
+        existing.length === intended.length &&
+        existing.every(
+          (candidate, index) =>
+            candidate.outbound === intended[index]?.outbound &&
+            candidate.ret === intended[index]?.ret &&
+            candidate.nights === intended[index]?.nights,
+        );
+      if (!matches) {
+        // Repair a missing/partial legacy queue without resetting healthy
+        // progress merely because the operator saved an unchanged form.
+        await repo.replaceCandidates(tracker.id, latest.id, intended);
+      }
+    }
     return { changed: false, configVersionId: latest.id, version: latest.version, reasons: [] };
   }
 
@@ -122,28 +142,14 @@ export async function ensureConfigVersion(
   const version = (latest?.version ?? 0) + 1;
   const reasons = latest === null ? [] : describeChanges(safeParse(latest.payload), payload);
 
-  if (latest !== null) await repo.closeConfigVersion(latest.id, at);
-
-  const id = await repo.insertConfigVersion(
-    tracker.id,
+  const id = await repo.transitionConfigVersion({
+    trackerId: tracker.id,
+    latestId: latest?.id ?? null,
     version,
     fingerprint,
-    JSON.stringify(payload),
-    at,
-  );
-  await repo.updateTrackerFields(tracker.id, {
-    current_config_version_id: id,
-    series_started_at: at,
-    // A new series has no baseline yet, so the previous summary must not carry
-    // over: comparing a new-series fare against an old-series low is exactly
-    // the mistake config versions exist to prevent.
-    latest_price_cents: null,
-    latest_observation_id: null,
-    latest_observed_at: null,
-    low_price_cents: null,
-    low_observation_id: null,
-    low_observed_at: null,
-    last_threshold_met: 0,
+    payload: JSON.stringify(payload),
+    effectiveFrom: at,
+    candidates: options.candidates,
   });
 
   tracker.current_config_version_id = id;
@@ -151,6 +157,7 @@ export async function ensureConfigVersion(
   tracker.low_price_cents = null;
   tracker.latest_price_cents = null;
   tracker.last_threshold_met = 0;
+  if (options.candidates !== undefined) tracker.coverage_cycle = 1;
 
   return { changed: true, configVersionId: id, version, reasons };
 }
@@ -182,8 +189,17 @@ export function describeChanges(
 
 function renderValue(value: unknown): string {
   if (value === null || value === undefined || value === "") return "not set";
-  if (Array.isArray(value)) return value.length ? value.join(", ") : "none";
-  return String(value);
+  if (Array.isArray(value)) {
+    const rendered = value.filter(
+      (item): item is string | number | boolean =>
+        typeof item === "string" || typeof item === "number" || typeof item === "boolean",
+    );
+    return rendered.length ? rendered.join(", ") : "none";
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "changed";
 }
 
 /** Move the tracker's next run forward by its configured interval. */

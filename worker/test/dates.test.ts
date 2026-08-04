@@ -100,6 +100,16 @@ describe("date-pair generation", () => {
     ).toThrow(DateWindowError);
   });
 
+  it("rejects calendar-looking dates that do not exist", () => {
+    expect(() =>
+      generatePairs({
+        outboundStart: "2026-02-31",
+        outboundEnd: "2026-03-05",
+        minNights: 3,
+      }),
+    ).toThrow(/Not a valid date/);
+  });
+
   it("rejects a max shorter than the min", () => {
     expect(() =>
       generatePairs({
@@ -205,6 +215,25 @@ describe("budget planning", () => {
     const three = estimate({ ...base, dateMode: DateMode.EXACT, marketCount: 3 }, 24 * 30);
     expect(three.callsPerScan).toBe(one.callsPerScan * 3);
     expect(three.callsRemainingThisMonth).toBe(one.callsRemainingThisMonth * 3);
+  });
+
+  it("separates planned searches from the capacity reserved for retries", () => {
+    const plan = { ...base, dateMode: DateMode.EXACT };
+    const est = estimate(plan, 24 * 30, 3);
+    expect(est.callsPerScan).toBe(1);
+    expect(est.maxCallsPerScan).toBe(3);
+    expect(est.callsPerFullCycle).toBe(1);
+    expect(est.maxCallsPerFullCycle).toBe(3);
+
+    const verdict = assess({
+      estimate: est,
+      remainingSafe: 2,
+      remainingHard: 2,
+      monthlyLimit: 250,
+      plan,
+    });
+    expect(verdict.severity).toBe("blocked");
+    expect(verdict.detail).toContain("capacity for up to 3 calls");
   });
 
   it("spreads a custom window across scans and reports the sweep length", () => {

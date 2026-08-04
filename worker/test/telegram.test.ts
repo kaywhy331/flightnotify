@@ -24,6 +24,7 @@ import {
 } from "../src/services/messages.js";
 import {
   TelegramNotifier,
+  MAX_TELEGRAM_RESPONSE_BYTES,
   escapeHtml,
   isRetryable,
   type FetchLike,
@@ -245,6 +246,8 @@ describe("error classification", () => {
     const result = await client.sendMessage("987", "hello");
     expect(result.category).toBe("timeout");
     expect(result.userMessage).toContain("still saved");
+    expect(result.userMessage).toContain("will not automatically repeat");
+    expect(result.userMessage).not.toContain("will retry");
   });
 
   it("reports any other transport failure as a network error", async () => {
@@ -252,6 +255,40 @@ describe("error classification", () => {
     const result = await client.sendMessage("987", "hello");
     expect(result.category).toBe("network");
     expect(result.userMessage).toContain("(TypeError)");
+    expect(result.userMessage).toContain("will not automatically repeat");
+  });
+
+  it("rejects a response whose declared length exceeds the safety limit", async () => {
+    const fetchImpl: FetchLike = async () =>
+      new Response("{}", {
+        status: 200,
+        headers: { "Content-Length": String(MAX_TELEGRAM_RESPONSE_BYTES + 1) },
+      });
+    const result = await new TelegramNotifier(CONFIG, { fetch: fetchImpl }).sendMessage(
+      "987",
+      "hello",
+    );
+    expect(result.category).toBe("ambiguous_response");
+    expect(result.retryable).toBe(false);
+    expect(result.userMessage).toContain("1 MiB safety limit");
+    expect(result.userMessage).toContain("risk a duplicate");
+  });
+
+  it("stops a streamed response that grows beyond the safety limit", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(MAX_TELEGRAM_RESPONSE_BYTES));
+        controller.enqueue(new Uint8Array(1));
+        controller.close();
+      },
+    });
+    const fetchImpl: FetchLike = async () => new Response(stream, { status: 200 });
+    const result = await new TelegramNotifier(CONFIG, { fetch: fetchImpl }).sendMessage(
+      "987",
+      "hello",
+    );
+    expect(result.category).toBe("ambiguous_response");
+    expect(result.meta["response_error"]).toBe("too_large");
   });
 
   it("refuses to call at all when no token is configured", async () => {
@@ -279,6 +316,7 @@ describe("retryable", () => {
       "server_error",
       "timeout",
       "network",
+      "ambiguous_response",
       "no_chats",
       "error",
     ];

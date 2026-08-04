@@ -8,11 +8,13 @@ const DEFAULT_ESTIMATE = {
   headline: "This configuration fits the remaining allowance.",
   detail: "The full sweep is affordable.",
   calls_per_scan: 1,
+  max_calls_per_scan: 3,
   remaining_safe: 244,
   monthly_limit: 250,
   candidate_count: 0,
   scans_per_full_cycle: 1,
   calls_per_full_cycle: 1,
+  max_calls_per_full_cycle: 3,
   suggestions: [],
   date_errors: [],
   severity: "ok",
@@ -30,15 +32,18 @@ function formHtml(values) {
   }).value;
 }
 
-function boot(values, estimate = DEFAULT_ESTIMATE) {
+function boot(values, estimate = DEFAULT_ESTIMATE, fetchImpl) {
   const dom = new JSDOM(`<!doctype html><body>${formHtml(values)}</body>`, {
     runScripts: "outside-only",
     url: "https://flightnotify.example/trackers/new",
   });
-  const fetchMock = vi.fn(async (..._args) => ({
-    ok: true,
-    json: async () => estimate,
-  }));
+  const fetchMock = vi.fn(
+    fetchImpl ??
+      (async (..._args) => ({
+        ok: true,
+        json: async () => estimate,
+      })),
+  );
   Object.defineProperty(dom.window, "fetch", {
     configurable: true,
     value: fetchMock,
@@ -114,6 +119,40 @@ describe("browser-script contract", () => {
       expect(box?.textContent).toContain("<script>alert(2)</script>");
       expect(box?.textContent).toContain("<b>fewer</b>");
       expect(box?.textContent).toContain("<svg onload=alert(3)>");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("ignores a stale estimate that resolves after a newer form request", async () => {
+    const pending = [];
+    const fetchImpl = () =>
+      new Promise((resolve) => {
+        pending.push(resolve);
+      });
+    const { dom, fetchMock } = boot({ date_mode: "exact" }, DEFAULT_ESTIMATE, fetchImpl);
+
+    try {
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      const adults = dom.window.document.querySelector("#adults");
+      adults.value = "3";
+      adults.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+      pending[1]({
+        ok: true,
+        json: async () => ({ ...DEFAULT_ESTIMATE, headline: "Current estimate" }),
+      });
+      const box = dom.window.document.querySelector("#budget-estimate");
+      await vi.waitFor(() => expect(box?.textContent).toContain("Current estimate"));
+
+      pending[0]({
+        ok: true,
+        json: async () => ({ ...DEFAULT_ESTIMATE, headline: "Stale estimate" }),
+      });
+      await new Promise((resolve) => dom.window.setTimeout(resolve, 0));
+      expect(box?.textContent).toContain("Current estimate");
+      expect(box?.textContent).not.toContain("Stale estimate");
     } finally {
       dom.window.close();
     }

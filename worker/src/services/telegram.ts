@@ -24,6 +24,7 @@ export type TelegramCategory =
   | "server_error"
   | "timeout"
   | "network"
+  | "ambiguous_response"
   | "no_chats"
   | "error";
 
@@ -93,6 +94,8 @@ export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
  * Worker's own 30s subrequest budget is the real ceiling anyway.
  */
 const DEFAULT_TIMEOUT_SECONDS = 20;
+/** Bot API JSON should be tiny; cap decompressed bodies far below Worker memory limits. */
+export const MAX_TELEGRAM_RESPONSE_BYTES = 1024 * 1024;
 
 type Scalar = string | number | boolean;
 
@@ -114,6 +117,51 @@ export function escapeHtml(text: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+class TelegramResponseBodyError extends Error {
+  constructor(readonly reason: "too_large" | "read_failed") {
+    super(reason);
+    this.name = "TelegramResponseBodyError";
+  }
+}
+
+async function boundedResponseText(response: Response): Promise<string> {
+  const header = response.headers.get("Content-Length");
+  if (header !== null) {
+    const declared = Number(header);
+    if (Number.isFinite(declared) && declared > MAX_TELEGRAM_RESPONSE_BYTES) {
+      throw new TelegramResponseBodyError("too_large");
+    }
+  }
+  if (response.body === null) return "";
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > MAX_TELEGRAM_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new TelegramResponseBodyError("too_large");
+      }
+      chunks.push(next.value);
+    }
+  } catch (error) {
+    if (error instanceof TelegramResponseBodyError) throw error;
+    throw new TelegramResponseBodyError("read_failed");
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 /** Rewrite every string reachable from `value`, structure preserved. */
@@ -229,11 +277,14 @@ export class TelegramNotifier {
       if (typeof chatId !== "number") continue;
 
       let name = ["first_name", "last_name"]
-        .filter((key) => chat[key])
-        .map((key) => String(chat[key]))
+        .map((key) => (typeof chat[key] === "string" ? chat[key] : ""))
+        .filter((value) => value !== "")
         .join(" ")
         .trim();
-      if (chat["username"]) name = `${name} (@${String(chat["username"])})`.trim();
+      const username = chat["username"];
+      if (typeof username === "string" && username !== "") {
+        name = `${name} (@${username})`.trim();
+      }
 
       const timestamp = message["date"];
       const text = message["text"];
@@ -245,7 +296,7 @@ export class TelegramNotifier {
           typeof timestamp === "number" && Number.isInteger(timestamp)
             ? new Date(timestamp * 1000)
             : null,
-        lastText: text ? String(text).slice(0, 120) : null,
+        lastText: typeof text === "string" ? text.slice(0, 120) : null,
       });
     }
 
@@ -456,9 +507,33 @@ export class TelegramNotifier {
       return this.redact(this.mapTransportError(error));
     }
 
+    let text: string;
+    try {
+      text = await boundedResponseText(response);
+    } catch (error) {
+      const reason =
+        error instanceof TelegramResponseBodyError ? error.reason : "read_failed";
+      const problem =
+        reason === "too_large"
+          ? "Telegram returned a response larger than the 1 MiB safety limit."
+          : "Telegram's response could not be read safely.";
+      return this.redact(
+        makeResult({
+          ok: false,
+          category: "ambiguous_response",
+          userMessage:
+            `${problem} ` +
+            (method === "sendMessage"
+              ? "Message delivery is uncertain, so FlightNotify will not automatically repeat it and risk a duplicate."
+              : "The request result is unknown; try the setup action again."),
+          meta: { response_error: reason },
+        }),
+      );
+    }
+
     let body: unknown;
     try {
-      body = await response.json();
+      body = text === "" ? {} : JSON.parse(text);
     } catch {
       // A body that is not JSON is treated as absent, so the HTTP status alone
       // drives classification -- same outcome as the Python `except ValueError`.
@@ -466,7 +541,7 @@ export class TelegramNotifier {
     }
     const parsed = isRecord(body) ? body : {};
 
-    if (parsed["ok"]) return makeResult({ ok: true, category: "ok", meta: parsed });
+    if (parsed["ok"] === true) return makeResult({ ok: true, category: "ok", meta: parsed });
     return this.redact(this.mapError(response.status, parsed));
   }
 
@@ -478,7 +553,8 @@ export class TelegramNotifier {
         category: "timeout",
         userMessage:
           "Telegram did not respond in time. Any price observation from this " +
-          "check is still saved. FlightNotify will retry on the next alert.",
+          "check is still saved. If this was a message send, delivery is uncertain, " +
+          "so FlightNotify will not automatically repeat it and risk a duplicate.",
       });
     }
     // Only a bare class name goes into the text -- never `error.message`, which
@@ -489,7 +565,9 @@ export class TelegramNotifier {
       category: "network",
       userMessage:
         `Could not reach Telegram (${label}). Any price observation ` +
-        "from this check is still saved. Check the Worker's network access.",
+        "from this check is still saved. If this was a message send, delivery is " +
+        "uncertain, so FlightNotify will not automatically repeat it and risk a duplicate. " +
+        "Check the Worker's network access.",
     });
   }
 

@@ -15,12 +15,19 @@
     "types": "wrangler types",
     "hash-password": "node scripts/hash-password.mjs",
     "build:static": "node scripts/build-static.mjs",
+    "lint": "eslint src test",
     "deploy": "node scripts/build-static.mjs && wrangler deploy"
+  },
+  "overrides": {
+    "undici": "7.29.0"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.20.1",
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.8.0",
     "jsdom": "^29.0.0",
     "typescript": "^5.7.3",
+    "typescript-eslint": "^8.66.0",
     "vitest": "^4.1.0",
     "wrangler": "^4.118.0"
   }

@@ -6,7 +6,12 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { Repo } from "../../src/db/repo.js";
 import { loadConfig, type Env } from "../../src/env.js";
 import { RunTrigger, TrackerStatus, type RunTriggerValue } from "../../src/domain/enums.js";
-import { TelegramBot, parseCommand, type BotNotifier } from "../../src/services/bot.js";
+import {
+  MAX_COMMAND_REPLY_ATTEMPTS,
+  TelegramBot,
+  parseCommand,
+  type BotNotifier,
+} from "../../src/services/bot.js";
 import { QuotaManager } from "../../src/services/quota.js";
 import type { CheckResult } from "../../src/services/search.js";
 import type { TelegramResult } from "../../src/services/telegram.js";
@@ -41,11 +46,11 @@ function telegramResult(
 class FakeNotifier implements BotNotifier {
   readonly sent: { chatId: string | number; text: string }[] = [];
 
-  constructor(private readonly results: TelegramResult[] = []) {}
+  constructor(private readonly results: Array<TelegramResult | Promise<TelegramResult>> = []) {}
 
   async sendMessage(chatId: string | number, text: string): Promise<TelegramResult> {
     this.sent.push({ chatId, text });
-    return this.results.shift() ?? telegramResult();
+    return await (this.results.shift() ?? telegramResult());
   }
 }
 
@@ -66,6 +71,8 @@ class FakeSearch {
       offersFound: 3,
       bestPriceCents: 99900,
       bestMarket: "us",
+      bestObservationId: 1,
+      successfulUnits: 1,
       statusMessages: ["Three itineraries considered."],
       errors: [],
       alerts: [],
@@ -191,6 +198,7 @@ beforeEach(async () => {
   await env.DB.exec("DELETE FROM tracker_markets");
   await env.DB.exec("DELETE FROM trackers");
   await env.DB.exec("DELETE FROM provider_calls");
+  await env.DB.exec("DELETE FROM provider_quota_hours");
   await env.DB.exec(
     "UPDATE provider_usage SET local_searches = 0, provider_this_month_usage = NULL, provider_searches_left = NULL",
   );
@@ -327,6 +335,53 @@ describe("authorisation and idempotency", () => {
     expect((await repo.telegramUpdate(30))?.delivery_attempts).toBe(2);
   });
 
+  it("allows only one overlapping invocation to send a prepared reply", async () => {
+    let release!: (result: TelegramResult) => void;
+    const pending = new Promise<TelegramResult>((resolve) => {
+      release = resolve;
+    });
+    const notifier = new FakeNotifier([pending]);
+    const { bot, repo } = makeBot({ notifier });
+
+    const first = post(bot, update(300, "/help"));
+    await vi.waitFor(() => expect(notifier.sent).toHaveLength(1));
+    expect((await repo.telegramUpdate(300))?.state).toBe("processing");
+
+    const overlap = await post(bot, update(300, "/help"));
+    expect(overlap.status).toBe(503);
+    expect(notifier.sent).toHaveLength(1);
+
+    release(telegramResult());
+    expect((await first).status).toBe(200);
+    expect((await post(bot, update(300, "/help"))).status).toBe(200);
+    expect(notifier.sent).toHaveLength(1);
+    expect((await repo.telegramUpdate(300))?.state).toBe("delivered");
+  });
+
+  it("stops retrying a prepared reply after the bounded attempt limit", async () => {
+    const failure = telegramResult({
+      ok: false,
+      messageId: null,
+      category: "server_error",
+      userMessage: "Telegram returned a server error.",
+      retryable: true,
+    });
+    const notifier = new FakeNotifier(Array(MAX_COMMAND_REPLY_ATTEMPTS + 1).fill(failure));
+    const { bot, repo } = makeBot({ notifier });
+
+    for (let attempt = 1; attempt <= MAX_COMMAND_REPLY_ATTEMPTS; attempt += 1) {
+      const response = await post(bot, update(301, "/help"));
+      expect(response.status).toBe(attempt < MAX_COMMAND_REPLY_ATTEMPTS ? 503 : 200);
+    }
+    expect((await post(bot, update(301, "/help"))).status).toBe(200);
+
+    const row = await repo.telegramUpdate(301);
+    expect(row?.state).toBe("failed");
+    expect(row?.delivery_attempts).toBe(MAX_COMMAND_REPLY_ATTEMPTS);
+    expect(row?.last_error).toContain(`stopped after ${MAX_COMMAND_REPLY_ATTEMPTS} attempts`);
+    expect(notifier.sent).toHaveLength(MAX_COMMAND_REPLY_ATTEMPTS);
+  });
+
   it("never re-executes a command whose first invocation died ambiguously", async () => {
     const id = await insertTracker();
     const search = new FakeSearch();
@@ -424,12 +479,35 @@ describe("commands", () => {
     });
     const { bot, repo } = makeBot();
     await post(bot, update(49, `/pause ${id}`));
-    expect((await repo.getTracker(id))?.status).toBe(TrackerStatus.PAUSED);
+    const paused = await repo.getTracker(id);
+    expect(paused?.status).toBe(TrackerStatus.PAUSED);
+    expect(paused?.next_run_at).toBeNull();
+    const resumedAt = Date.now();
     await post(bot, update(50, `/resume ${id}`));
     const resumed = await repo.getTracker(id);
     expect(resumed?.status).toBe(TrackerStatus.ACTIVE);
     expect(resumed?.consecutive_failures).toBe(0);
     expect(resumed?.last_error_category).toBeNull();
     expect(resumed?.next_run_at).not.toBeNull();
+    expect(Math.abs(new Date(resumed!.next_run_at!).getTime() - resumedAt)).toBeLessThan(5_000);
+  });
+
+  it("does not race a tracker action or resume a completed trip", async () => {
+    const id = await insertTracker();
+    const { bot, notifier, repo } = makeBot();
+    await repo.acquireTrackerLock(id, "scheduled:test", 300);
+
+    await post(bot, update(51, `/pause ${id}`));
+    expect((await repo.getTracker(id))?.status).toBe(TrackerStatus.ACTIVE);
+    expect(notifier.sent[0]?.text).toContain("already running");
+    await repo.releaseTrackerLock(id, "scheduled:test");
+
+    await repo.updateTrackerFields(id, { status: TrackerStatus.COMPLETED, next_run_at: null });
+    await post(bot, update(52, `/pause ${id}`));
+    expect((await repo.getTracker(id))?.status).toBe(TrackerStatus.COMPLETED);
+    expect(notifier.sent[1]?.text).toContain("Edit it with future dates");
+    await post(bot, update(53, `/resume ${id}`));
+    expect((await repo.getTracker(id))?.status).toBe(TrackerStatus.COMPLETED);
+    expect(notifier.sent[2]?.text).toContain("Edit it with future dates");
   });
 });

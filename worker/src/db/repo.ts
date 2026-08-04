@@ -23,6 +23,7 @@ import {
   type AuthThrottleRow,
   type CronRunRow,
   type FareObservationRow,
+  type FlexibleCandidateMarketRow,
   type FlexibleDateCandidateRow,
   type ProviderUsageRow,
   type SchedulerStateRow,
@@ -32,6 +33,8 @@ import {
   type TrackerRow,
   type TrackerWithMarkets,
 } from "./rows.js";
+
+export const EXPECTED_SCHEMA_VERSION = "3";
 
 export class D1Error extends Error {
   constructor(
@@ -213,6 +216,31 @@ export class Repo {
     );
   }
 
+  /** Extend a tracker lease only while it is still live and owned by caller. */
+  async renewTrackerLock(
+    trackerId: number,
+    owner: string,
+    ttlSeconds: number,
+    now = new Date(),
+  ): Promise<boolean> {
+    const result = await guard("renewTrackerLock", () =>
+      this.db
+        .prepare(
+          `UPDATE trackers SET lock_expires_at = ?3
+             WHERE id = ?1 AND lock_owner = ?2
+               AND lock_expires_at IS NOT NULL AND lock_expires_at > ?4`,
+        )
+        .bind(
+          trackerId,
+          owner,
+          toIso(new Date(now.getTime() + ttlSeconds * 1000)),
+          toIso(now),
+        )
+        .run(),
+    );
+    return (result.meta.changes ?? 0) > 0;
+  }
+
   async updateTrackerFields(id: number, fields: Record<string, unknown>): Promise<void> {
     const keys = Object.keys(fields);
     if (keys.length === 0) return;
@@ -236,6 +264,63 @@ export class Repo {
         .run(),
     );
     return Number(result.meta.last_row_id);
+  }
+
+  /** Create a tracker and all of its markets in one D1 transaction. */
+  async insertTrackerWithMarkets(
+    fields: Record<string, unknown>,
+    markets: string[],
+  ): Promise<number> {
+    const keys = Object.keys(fields);
+    const tracker = this.db
+      .prepare(
+        `INSERT INTO trackers (${keys.join(", ")})
+         VALUES (${keys.map((_, index) => `?${index + 1}`).join(", ")})`,
+      )
+      .bind(...keys.map((key) => fields[key] as never));
+    const statements: D1PreparedStatement[] = [tracker];
+    if (markets.length > 0) {
+      const values = markets
+        .map((_, index) => `((SELECT MAX(id) FROM trackers), ?${index * 2 + 1}, ?${index * 2 + 2})`)
+        .join(", ");
+      statements.push(
+        this.db
+          .prepare(`INSERT INTO tracker_markets (tracker_id, market, priority) VALUES ${values}`)
+          .bind(...markets.flatMap((market, index) => [market, index])),
+      );
+    }
+    const results = await guard("insertTrackerWithMarkets", () => this.db.batch(statements));
+    return Number(results[0]?.meta.last_row_id);
+  }
+
+  /** Update tracker fields and replace markets atomically. */
+  async updateTrackerWithMarkets(
+    id: number,
+    fields: Record<string, unknown>,
+    markets: string[],
+  ): Promise<void> {
+    const keys = Object.keys(fields);
+    const statements: D1PreparedStatement[] = [];
+    if (keys.length > 0) {
+      statements.push(
+        this.db
+          .prepare(
+            `UPDATE trackers SET ${keys.map((key, index) => `${key} = ?${index + 2}`).join(", ")},
+                    updated_at = ?${keys.length + 2}
+              WHERE id = ?1`,
+          )
+          .bind(id, ...keys.map((key) => fields[key] as never), nowIso()),
+      );
+    }
+    statements.push(this.db.prepare("DELETE FROM tracker_markets WHERE tracker_id = ?").bind(id));
+    markets.forEach((market, index) => {
+      statements.push(
+        this.db
+          .prepare("INSERT INTO tracker_markets (tracker_id, market, priority) VALUES (?, ?, ?)")
+          .bind(id, market, index),
+      );
+    });
+    await guard("updateTrackerWithMarkets", () => this.db.batch(statements));
   }
 
   async deleteTracker(id: number): Promise<void> {
@@ -295,6 +380,97 @@ export class Repo {
         .run(),
     );
     return Number(result.meta.last_row_id);
+  }
+
+  /**
+   * Close the previous series, create the next one, reset summaries, and
+   * optionally rebuild its flexible-date queue in one atomic D1 batch.
+   */
+  async transitionConfigVersion(args: {
+    trackerId: number;
+    latestId: number | null;
+    version: number;
+    fingerprint: string;
+    payload: string;
+    effectiveFrom: string;
+    candidates?: { outbound: string; ret: string; nights: number }[];
+  }): Promise<number> {
+    const statements: D1PreparedStatement[] = [];
+    if (args.latestId !== null) {
+      statements.push(
+        this.db
+          .prepare("UPDATE tracker_config_versions SET effective_to = ? WHERE id = ?")
+          .bind(args.effectiveFrom, args.latestId),
+      );
+    }
+    const insertIndex = statements.length;
+    statements.push(
+      this.db
+        .prepare(
+          `INSERT INTO tracker_config_versions
+             (tracker_id, version, fingerprint, payload, effective_from, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          args.trackerId,
+          args.version,
+          args.fingerprint,
+          args.payload,
+          args.effectiveFrom,
+          args.effectiveFrom,
+        ),
+    );
+    statements.push(
+      this.db
+        .prepare(
+          `UPDATE trackers
+              SET current_config_version_id = (
+                    SELECT id FROM tracker_config_versions
+                     WHERE tracker_id = ?1 AND version = ?2
+                  ),
+                  series_started_at = ?3,
+                  latest_price_cents = NULL,
+                  latest_observation_id = NULL,
+                  latest_observed_at = NULL,
+                  low_price_cents = NULL,
+                  low_observation_id = NULL,
+                  low_observed_at = NULL,
+                  last_threshold_met = 0,
+                  coverage_cycle = CASE WHEN ?4 = 1 THEN 1 ELSE coverage_cycle END,
+                  updated_at = ?3
+            WHERE id = ?1`,
+        )
+        .bind(args.trackerId, args.version, args.effectiveFrom, args.candidates === undefined ? 0 : 1),
+    );
+
+    if (args.candidates !== undefined) {
+      statements.push(
+        this.db.prepare("DELETE FROM flexible_date_candidates WHERE tracker_id = ?").bind(args.trackerId),
+      );
+      args.candidates.forEach((candidate, index) => {
+        statements.push(
+          this.db
+            .prepare(
+              `INSERT INTO flexible_date_candidates
+                 (tracker_id, config_version_id, outbound_date, return_date, nights, order_index, cycle, status)
+               VALUES (?1, (
+                 SELECT id FROM tracker_config_versions WHERE tracker_id = ?1 AND version = ?2
+               ), ?3, ?4, ?5, ?6, 1, 'pending')`,
+            )
+            .bind(
+              args.trackerId,
+              args.version,
+              candidate.outbound,
+              candidate.ret,
+              candidate.nights,
+              index,
+            ),
+        );
+      });
+    }
+
+    const results = await guard("transitionConfigVersion", () => this.db.batch(statements));
+    return Number(results[insertIndex]?.meta.last_row_id);
   }
 
   async closeConfigVersion(id: number, effectiveTo: string): Promise<void> {
@@ -392,16 +568,30 @@ export class Repo {
     return results.map((r) => Number(r.meta.last_row_id));
   }
 
-  async observationsForTracker(trackerId: number, limit = 200): Promise<FareObservationRow[]> {
+  async observationsForTracker(
+    trackerId: number,
+    limit = 200,
+    offset = 0,
+  ): Promise<FareObservationRow[]> {
     const result = await this.db
       .prepare(
         `SELECT * FROM fare_observations
-          WHERE tracker_id = ? AND eligible = 1
-          ORDER BY observed_at DESC LIMIT ?`,
+          WHERE tracker_id = ?1 AND eligible = 1
+          ORDER BY observed_at DESC, id DESC LIMIT ?2 OFFSET ?3`,
       )
-      .bind(trackerId, limit)
+      .bind(trackerId, limit, Math.max(0, offset))
       .all<FareObservationRow>();
     return (result.results ?? []) as FareObservationRow[];
+  }
+
+  async countObservationsForTracker(trackerId: number): Promise<number> {
+    const row = await this.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM fare_observations WHERE tracker_id = ? AND eligible = 1",
+      )
+      .bind(trackerId)
+      .first<{ n: number }>();
+    return row?.n ?? 0;
   }
 
   async getObservation(id: number): Promise<FareObservationRow | null> {
@@ -469,22 +659,145 @@ export class Repo {
       .first<AlertEventRow>();
   }
 
-  async pendingAlerts(maxAttempts: number, limit = 20): Promise<AlertEventRow[]> {
-    const result = await this.db
-      .prepare(
-        `SELECT * FROM alert_events
-          WHERE delivery_state IN ('pending', 'failed') AND attempts < ?1
-          ORDER BY created_at LIMIT ?2`,
-      )
-      .bind(maxAttempts, limit)
-      .all<AlertEventRow>();
+  /** Atomically claim one newly-created alert before making a network call. */
+  async claimAlert(
+    id: number,
+    owner: string,
+    maxAttempts: number,
+    ttlSeconds: number,
+    now = new Date(),
+  ): Promise<AlertEventRow | null> {
+    const at = toIso(now);
+    return guard("claimAlert", () =>
+      this.db
+        .prepare(
+          `UPDATE alert_events
+              SET delivery_state = 'sending', attempts = attempts + 1,
+                  retryable = 0, claim_owner = ?2, claim_expires_at = ?3
+            WHERE id = ?1 AND attempts < ?4
+              AND (
+                delivery_state = 'pending'
+                OR (
+                  delivery_state = 'failed' AND retryable = 1
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?5)
+                )
+              )
+          RETURNING *`,
+        )
+        .bind(id, owner, toIso(new Date(now.getTime() + ttlSeconds * 1000)), maxAttempts, at)
+        .first<AlertEventRow>(),
+    );
+  }
+
+  /**
+   * Claim a bounded retry batch in one SQLite write.  UPDATE ... RETURNING is
+   * the queue boundary: two invocations can never receive the same row.
+   */
+  async claimPendingAlerts(
+    owner: string,
+    maxAttempts: number,
+    limit: number,
+    ttlSeconds: number,
+    now = new Date(),
+  ): Promise<AlertEventRow[]> {
+    const at = toIso(now);
+    const result = await guard("claimPendingAlerts", () =>
+      this.db
+        .prepare(
+          `WITH candidates AS (
+             SELECT id FROM alert_events
+              WHERE attempts < ?1
+                AND (
+                  delivery_state = 'pending'
+                  OR (
+                    delivery_state = 'failed' AND retryable = 1
+                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
+                  )
+                )
+              ORDER BY created_at, id
+              LIMIT ?3
+           )
+           UPDATE alert_events
+              SET delivery_state = 'sending', attempts = attempts + 1,
+                  retryable = 0, claim_owner = ?4, claim_expires_at = ?5
+            WHERE id IN (SELECT id FROM candidates)
+          RETURNING *`,
+        )
+        .bind(
+          maxAttempts,
+          at,
+          Math.max(0, limit),
+          owner,
+          toIso(new Date(now.getTime() + ttlSeconds * 1000)),
+        )
+        .all<AlertEventRow>(),
+    );
     return (result.results ?? []) as AlertEventRow[];
+  }
+
+  /** Complete a delivery only while the caller still owns its claim. */
+  async completeAlertClaim(
+    id: number,
+    owner: string,
+    fields: Record<string, unknown>,
+  ): Promise<boolean> {
+    const merged: Record<string, unknown> = {
+      ...fields,
+      claim_owner: null,
+      claim_expires_at: null,
+    };
+    const keys = Object.keys(merged);
+    const result = await guard("completeAlertClaim", () =>
+      this.db
+        .prepare(
+          `UPDATE alert_events
+              SET ${keys.map((key, index) => `${key} = ?${index + 3}`).join(", ")}
+            WHERE id = ?1 AND claim_owner = ?2 AND delivery_state = 'sending'`,
+        )
+        .bind(id, owner, ...keys.map((key) => merged[key] as never))
+        .run(),
+    );
+    return (result.meta.changes ?? 0) > 0;
+  }
+
+  /**
+   * A Worker that died while sending cannot prove whether Telegram accepted
+   * the request.  Park the row for operator review instead of auto-retrying.
+   */
+  async markExpiredAlertClaimsUncertain(now = new Date()): Promise<number> {
+    const result = await guard("markExpiredAlertClaimsUncertain", () =>
+      this.db
+        .prepare(
+          `UPDATE alert_events
+              SET delivery_state = 'uncertain', retryable = 0,
+                  claim_owner = NULL, claim_expires_at = NULL,
+                  last_error = COALESCE(
+                    last_error,
+                    'The delivery worker stopped before Telegram confirmation; delivery may have succeeded and was not retried.'
+                  )
+            WHERE delivery_state = 'sending'
+              AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?`,
+        )
+        .bind(toIso(now))
+        .run(),
+    );
+    return result.meta.changes ?? 0;
   }
 
   async recentAlerts(limit = 20): Promise<AlertEventRow[]> {
     const result = await this.db
       .prepare("SELECT * FROM alert_events ORDER BY created_at DESC LIMIT ?")
       .bind(limit)
+      .all<AlertEventRow>();
+    return (result.results ?? []) as AlertEventRow[];
+  }
+
+  async recentAlertsForTracker(trackerId: number, limit = 20): Promise<AlertEventRow[]> {
+    const result = await this.db
+      .prepare(
+        "SELECT * FROM alert_events WHERE tracker_id = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2",
+      )
+      .bind(trackerId, limit)
       .all<AlertEventRow>();
     return (result.results ?? []) as AlertEventRow[];
   }
@@ -518,6 +831,100 @@ export class Repo {
       .bind(toIso(since))
       .first<{ n: number }>();
     return row?.n ?? 0;
+  }
+
+  /**
+   * Atomically reserve monthly capacity before a provider request starts.
+   *
+   * The conditional UPDATE is the concurrency primitive: D1 serializes the
+   * statement, so two invocations cannot both spend the same final slot.  The
+   * provider-reported usage/remaining pair is folded into the same predicate
+   * whenever it is available.
+   */
+  async reserveMonthlyCalls(period: string, count: number, allowedLimit: number): Promise<boolean> {
+    if (count <= 0 || allowedLimit <= 0) return false;
+    const result = await guard("reserveMonthlyCalls", () =>
+      this.db
+        .prepare(
+          `UPDATE provider_usage
+              SET local_searches = MAX(local_searches, COALESCE(provider_this_month_usage, 0)) + ?2
+            WHERE provider = 'serpapi' AND period = ?1
+              AND MAX(local_searches, COALESCE(provider_this_month_usage, 0)) + ?2 <= ?3
+              AND (
+                provider_this_month_usage IS NULL OR provider_searches_left IS NULL OR
+                MAX(local_searches, provider_this_month_usage) + ?2 <=
+                  provider_this_month_usage + provider_searches_left
+              )`,
+        )
+        .bind(period, count, allowedLimit)
+        .run(),
+    );
+    return (result.meta.changes ?? 0) === 1;
+  }
+
+  async releaseMonthlyCalls(period: string, count: number): Promise<void> {
+    if (count <= 0) return;
+    await guard("releaseMonthlyCalls", () =>
+      this.db
+        .prepare(
+          `UPDATE provider_usage
+              SET local_searches = MAX(COALESCE(provider_this_month_usage, 0), local_searches - ?2)
+            WHERE provider = 'serpapi' AND period = ?1`,
+        )
+        .bind(period, count)
+        .run(),
+    );
+  }
+
+  /** Reserve a fixed UTC-hour bucket. The UPSERT predicate is atomic. */
+  async reserveHourlyCalls(hour: string, count: number, limit: number): Promise<boolean> {
+    if (count <= 0 || count > limit) return false;
+    const result = await guard("reserveHourlyCalls", () =>
+      this.db
+        .prepare(
+          `INSERT INTO provider_quota_hours (provider, hour, used, updated_at)
+           VALUES ('serpapi', ?1, ?2, ?3)
+           ON CONFLICT (provider, hour) DO UPDATE SET
+             used = used + excluded.used,
+             updated_at = excluded.updated_at
+           WHERE used + excluded.used <= ?4`,
+        )
+        .bind(hour, count, nowIso(), limit)
+        .run(),
+    );
+    return (result.meta.changes ?? 0) === 1;
+  }
+
+  async releaseHourlyCalls(hour: string, count: number): Promise<void> {
+    if (count <= 0) return;
+    await guard("releaseHourlyCalls", () =>
+      this.db
+        .prepare(
+          `UPDATE provider_quota_hours
+              SET used = MAX(0, used - ?2), updated_at = ?3
+            WHERE provider = 'serpapi' AND hour = ?1`,
+        )
+        .bind(hour, count, nowIso())
+        .run(),
+    );
+  }
+
+  /** Persist the actual attempts after a conservative reservation settles. */
+  async insertProviderCallRows(
+    endpoint: string,
+    runId: number | null,
+    count: number,
+    calledAt = nowIso(),
+  ): Promise<void> {
+    if (count <= 0) return;
+    const statement = this.db.prepare(
+      "INSERT INTO provider_calls (provider, endpoint, called_at, search_run_id) VALUES ('serpapi', ?, ?, ?)",
+    );
+    await guard("insertProviderCallRows", () =>
+      this.db.batch(
+        Array.from({ length: count }, () => statement.bind(endpoint, calledAt, runId)),
+      ),
+    );
   }
 
   /**
@@ -575,6 +982,28 @@ export class Repo {
     return result.meta.changes ?? 0;
   }
 
+  async pruneQuotaHours(beforeHour: string): Promise<number> {
+    const result = await this.db
+      .prepare("DELETE FROM provider_quota_hours WHERE provider = 'serpapi' AND hour < ?")
+      .bind(beforeHour)
+      .run();
+    return result.meta.changes ?? 0;
+  }
+
+  async pruneAuthThrottle(before: Date, now = new Date()): Promise<number> {
+    const result = await guard("pruneAuthThrottle", () =>
+      this.db
+        .prepare(
+          `DELETE FROM auth_throttle
+            WHERE last_failed_at < ?1
+              AND (locked_until IS NULL OR locked_until <= ?2)`,
+        )
+        .bind(toIso(before), toIso(now))
+        .run(),
+    );
+    return result.meta.changes ?? 0;
+  }
+
   // ----------------------------------------------------------------- cache
   async cacheGet(fingerprint: string, now: Date): Promise<string | null> {
     const row = await this.db
@@ -611,6 +1040,10 @@ export class Repo {
       .bind(toIso(now))
       .run();
     return result.meta.changes ?? 0;
+  }
+
+  async cacheDelete(fingerprint: string): Promise<void> {
+    await this.db.prepare("DELETE FROM query_cache WHERE fingerprint = ?").bind(fingerprint).run();
   }
 
   // -------------------------------------------------------------- settings
@@ -705,6 +1138,28 @@ export class Repo {
     );
   }
 
+  /** Atomically reserve one prepared command-reply delivery attempt. */
+  async claimTelegramReplyDelivery(
+    updateId: number,
+    expectedAttempts: number,
+    maxAttempts: number,
+    now: Date = new Date(),
+  ): Promise<boolean> {
+    const result = await guard("claimTelegramReplyDelivery", () =>
+      this.db
+        .prepare(
+          `UPDATE telegram_updates
+              SET state = 'processing', delivery_attempts = delivery_attempts + 1,
+                  updated_at = ?4
+            WHERE update_id = ?1 AND state = 'ready'
+              AND delivery_attempts = ?2 AND delivery_attempts < ?3`,
+        )
+        .bind(updateId, expectedAttempts, maxAttempts, toIso(now))
+        .run(),
+    );
+    return (result.meta.changes ?? 0) > 0;
+  }
+
   async pruneTelegramUpdates(before: Date): Promise<number> {
     const result = await guard("pruneTelegramUpdates", () =>
       this.db.prepare("DELETE FROM telegram_updates WHERE updated_at < ?").bind(toIso(before)).run(),
@@ -757,6 +1212,54 @@ export class Repo {
       )
       .bind(owner, error)
       .run();
+  }
+
+  /** Renew only an unexpired lease still owned by this invocation. */
+  async renewSchedulerLease(
+    owner: string,
+    ttlSeconds: number,
+    now = new Date(),
+  ): Promise<boolean> {
+    const result = await guard("renewSchedulerLease", () =>
+      this.db
+        .prepare(
+          `UPDATE scheduler_state SET lock_expires_at = ?2
+             WHERE id = 1 AND lock_owner = ?1
+               AND lock_expires_at IS NOT NULL AND lock_expires_at > ?3`,
+        )
+        .bind(owner, toIso(new Date(now.getTime() + ttlSeconds * 1000)), toIso(now))
+        .run(),
+    );
+    return (result.meta.changes ?? 0) > 0;
+  }
+
+  /** Claim the once-daily cleanup pass with one conditional write. */
+  async claimHousekeeping(now = new Date(), intervalHours = 24): Promise<boolean> {
+    const cutoff = toIso(new Date(now.getTime() - intervalHours * 60 * 60 * 1000));
+    const result = await guard("claimHousekeeping", () =>
+      this.db
+        .prepare(
+          `UPDATE scheduler_state SET last_cleanup_at = ?1
+             WHERE id = 1 AND (last_cleanup_at IS NULL OR last_cleanup_at <= ?2)`,
+        )
+        .bind(toIso(now), cutoff)
+        .run(),
+    );
+    return (result.meta.changes ?? 0) > 0;
+  }
+
+  /** Release only this invocation's housekeeping claim after a failed pass. */
+  async releaseHousekeepingClaim(claimedAt: Date): Promise<boolean> {
+    const result = await guard("releaseHousekeepingClaim", () =>
+      this.db
+        .prepare(
+          `UPDATE scheduler_state SET last_cleanup_at = NULL
+             WHERE id = 1 AND last_cleanup_at = ?1`,
+        )
+        .bind(toIso(claimedAt))
+        .run(),
+    );
+    return (result.meta.changes ?? 0) > 0;
   }
 
   async recordSweepState(state: string | null): Promise<void> {
@@ -819,15 +1322,67 @@ export class Repo {
    * spending searches on flights that can no longer be boarded.
    */
   async skipPastCandidates(configVersionId: number, today: string): Promise<number> {
+    const at = nowIso();
+    const results = await guard("skipPastCandidates", () =>
+      this.db.batch([
+        this.db
+          .prepare(
+            `UPDATE flexible_candidate_markets
+                SET status = 'checked', last_checked_at = ?3
+              WHERE status = 'pending' AND candidate_id IN (
+                SELECT id FROM flexible_date_candidates
+                 WHERE config_version_id = ?1 AND outbound_date < ?2
+              )`,
+          )
+          .bind(configVersionId, today, at),
+        this.db
+          .prepare(
+            `UPDATE flexible_date_candidates
+                SET status = 'checked', last_checked_at = ?3
+              WHERE config_version_id = ?1 AND status = 'pending' AND outbound_date < ?2`,
+          )
+          .bind(configVersionId, today, at),
+      ]),
+    );
+    return results[1]?.meta.changes ?? 0;
+  }
+
+  /** Ensure every candidate has one independently tracked row per market. */
+  async ensureCandidateMarkets(configVersionId: number, markets: string[]): Promise<void> {
+    const unique = [...new Set(markets.map((market) => market.trim().toLowerCase()).filter(Boolean))];
+    if (unique.length === 0) return;
+    await guard("ensureCandidateMarkets", () =>
+      this.db.batch(
+        unique.map((market) =>
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO flexible_candidate_markets
+                 (candidate_id, market, cycle, status)
+               SELECT id, ?2, cycle, status
+                 FROM flexible_date_candidates
+                WHERE config_version_id = ?1`,
+            )
+            .bind(configVersionId, market),
+        ),
+      ),
+    );
+  }
+
+  async pendingCandidateMarkets(
+    candidateIds: number[],
+    cycle: number,
+  ): Promise<FlexibleCandidateMarketRow[]> {
+    if (candidateIds.length === 0) return [];
+    const placeholders = candidateIds.map((_, index) => `?${index + 2}`).join(", ");
     const result = await this.db
       .prepare(
-        `UPDATE flexible_date_candidates
-            SET status = 'checked', last_checked_at = ?3
-          WHERE config_version_id = ?1 AND status = 'pending' AND outbound_date < ?2`,
+        `SELECT * FROM flexible_candidate_markets
+          WHERE cycle = ?1 AND status = 'pending' AND candidate_id IN (${placeholders})
+          ORDER BY candidate_id, market`,
       )
-      .bind(configVersionId, today, nowIso())
-      .run();
-    return result.meta.changes ?? 0;
+      .bind(cycle, ...candidateIds)
+      .all<FlexibleCandidateMarketRow>();
+    return (result.results ?? []) as FlexibleCandidateMarketRow[];
   }
 
   /** Cheapest-first view of a window's date pairs, checked ones first. */
@@ -846,6 +1401,25 @@ export class Repo {
       .bind(configVersionId, cycle, limit)
       .all<FlexibleDateCandidateRow>();
     return (result.results ?? []) as FlexibleDateCandidateRow[];
+  }
+
+  async candidateDefinitions(
+    configVersionId: number,
+  ): Promise<{ outbound: string; ret: string; nights: number }[]> {
+    const result = await this.db
+      .prepare(
+        `SELECT outbound_date, return_date, nights
+           FROM flexible_date_candidates
+          WHERE config_version_id = ?
+          ORDER BY order_index`,
+      )
+      .bind(configVersionId)
+      .all<{ outbound_date: string; return_date: string; nights: number }>();
+    return (result.results ?? []).map((row) => ({
+      outbound: row.outbound_date,
+      ret: row.return_date,
+      nights: row.nights,
+    }));
   }
 
   async claimCandidates(
@@ -929,15 +1503,92 @@ export class Repo {
       .run();
   }
 
+  /**
+   * Finish one market and atomically refresh the parent date-pair aggregate.
+   * The parent stays pending while any market remains, so a quota clamp or a
+   * partial failure is resumed on the next invocation instead of lost.
+   */
+  async markCandidateMarketChecked(
+    candidateId: number,
+    market: string,
+    cycle: number,
+    status: string,
+    runId: number | null,
+    priceCents: number | null,
+  ): Promise<void> {
+    const at = nowIso();
+    await guard("markCandidateMarketChecked", () =>
+      this.db.batch([
+        this.db
+          .prepare(
+            `UPDATE flexible_candidate_markets
+                SET status = ?4, last_checked_at = ?5, last_run_id = ?6,
+                    check_count = check_count + 1, last_price_cents = ?7
+              WHERE candidate_id = ?1 AND market = ?2 AND cycle = ?3`,
+          )
+          .bind(candidateId, market, cycle, status, at, runId, priceCents),
+        this.db
+          .prepare(
+            `UPDATE flexible_date_candidates
+                SET status = CASE
+                      WHEN EXISTS (
+                        SELECT 1 FROM flexible_candidate_markets
+                         WHERE candidate_id = ?1 AND cycle = ?2 AND status = 'pending'
+                      ) THEN 'pending'
+                      WHEN EXISTS (
+                        SELECT 1 FROM flexible_candidate_markets
+                         WHERE candidate_id = ?1 AND cycle = ?2 AND status = 'checked'
+                      ) THEN 'checked'
+                      ELSE 'failed'
+                    END,
+                    last_checked_at = CASE
+                      WHEN EXISTS (
+                        SELECT 1 FROM flexible_candidate_markets
+                         WHERE candidate_id = ?1 AND cycle = ?2 AND status = 'pending'
+                      ) THEN last_checked_at ELSE ?3 END,
+                    last_run_id = CASE
+                      WHEN EXISTS (
+                        SELECT 1 FROM flexible_candidate_markets
+                         WHERE candidate_id = ?1 AND cycle = ?2 AND status = 'pending'
+                      ) THEN last_run_id ELSE ?4 END,
+                    check_count = check_count + CASE
+                      WHEN status = 'pending' AND NOT EXISTS (
+                        SELECT 1 FROM flexible_candidate_markets
+                         WHERE candidate_id = ?1 AND cycle = ?2 AND status = 'pending'
+                      ) THEN 1 ELSE 0 END,
+                    last_price_cents = (
+                      SELECT MIN(last_price_cents) FROM flexible_candidate_markets
+                       WHERE candidate_id = ?1 AND cycle = ?2 AND status = 'checked'
+                    )
+              WHERE id = ?1 AND cycle = ?2`,
+          )
+          .bind(candidateId, cycle, at, runId),
+      ]),
+    );
+  }
+
   /** Start a new sweep cycle once every candidate has been visited. */
-  async startNextCycle(configVersionId: number, cycle: number): Promise<void> {
-    await this.db
-      .prepare(
-        `UPDATE flexible_date_candidates SET status = 'pending', cycle = ?2
-          WHERE config_version_id = ?1`,
-      )
-      .bind(configVersionId, cycle)
-      .run();
+  async startNextCycle(configVersionId: number, cycle: number, today: string): Promise<void> {
+    await guard("startNextCycle", () =>
+      this.db.batch([
+        this.db
+          .prepare(
+            `UPDATE flexible_candidate_markets
+                SET status = 'pending', cycle = ?2
+              WHERE candidate_id IN (
+                SELECT id FROM flexible_date_candidates
+                 WHERE config_version_id = ?1 AND outbound_date >= ?3
+              )`,
+          )
+          .bind(configVersionId, cycle, today),
+        this.db
+          .prepare(
+            `UPDATE flexible_date_candidates SET status = 'pending', cycle = ?2
+              WHERE config_version_id = ?1 AND outbound_date >= ?3`,
+          )
+          .bind(configVersionId, cycle, today),
+      ]),
+    );
   }
 
   /** Per-tracker min/max/count of best-of-run fares since `sinceIso`. */
@@ -992,18 +1643,35 @@ export class Repo {
     return this.db.prepare("SELECT * FROM auth_throttle WHERE key = ?").bind(key).first<AuthThrottleRow>();
   }
 
-  async recordAuthFailure(key: string, lockedUntil: string | null): Promise<void> {
-    const at = nowIso();
+  async recordAuthFailure(
+    key: string,
+    maxFailures: number,
+    lockedUntil: string,
+    resetBefore: string,
+    at = nowIso(),
+  ): Promise<void> {
     await this.db
       .prepare(
         `INSERT INTO auth_throttle (key, fail_count, first_failed_at, last_failed_at, locked_until)
-         VALUES (?1, 1, ?2, ?2, ?3)
+         VALUES (?1, 1, ?2, ?2, NULL)
          ON CONFLICT (key) DO UPDATE SET
-           fail_count = auth_throttle.fail_count + 1,
+           fail_count = CASE
+             WHEN auth_throttle.first_failed_at <= ?5
+               OR (auth_throttle.locked_until IS NOT NULL AND auth_throttle.locked_until <= ?2)
+             THEN 1 ELSE auth_throttle.fail_count + 1 END,
+           first_failed_at = CASE
+             WHEN auth_throttle.first_failed_at <= ?5
+               OR (auth_throttle.locked_until IS NOT NULL AND auth_throttle.locked_until <= ?2)
+             THEN ?2 ELSE auth_throttle.first_failed_at END,
            last_failed_at = ?2,
-           locked_until = ?3`,
+           locked_until = CASE
+             WHEN auth_throttle.first_failed_at <= ?5
+               OR (auth_throttle.locked_until IS NOT NULL AND auth_throttle.locked_until <= ?2)
+             THEN NULL
+             WHEN auth_throttle.fail_count + 1 >= ?4 THEN ?3
+             ELSE auth_throttle.locked_until END`,
       )
-      .bind(key, at, lockedUntil)
+      .bind(key, at, lockedUntil, maxFailures, resetBefore)
       .run();
   }
 
@@ -1025,7 +1693,16 @@ export class Repo {
           detail: "Connected, but schema_meta is empty. Run the D1 migrations.",
         };
       }
-      return { ok: true, schemaVersion: row.value, detail: "Connected." };
+      if (row.value !== EXPECTED_SCHEMA_VERSION) {
+        return {
+          ok: false,
+          schemaVersion: row.value,
+          detail:
+            `Connected, but schema v${row.value} is installed and ` +
+            `v${EXPECTED_SCHEMA_VERSION} is required. Apply the pending D1 migrations.`,
+        };
+      }
+      return { ok: true, schemaVersion: row.value, detail: "Connected and current." };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {

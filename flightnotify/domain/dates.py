@@ -8,7 +8,7 @@ from datetime import date, timedelta
 
 #: Hard ceiling on generated combinations. Above this the window is refused with
 #: actionable guidance rather than quietly truncated.
-MAX_CANDIDATES = 2000
+MAX_CANDIDATES = 500
 
 
 @dataclass(frozen=True, slots=True)

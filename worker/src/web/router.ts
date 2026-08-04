@@ -14,6 +14,7 @@ import { AlertService } from "../services/alerts.js";
 import { QuotaManager } from "../services/quota.js";
 import { SearchService } from "../services/search.js";
 import { SerpApiProvider } from "../providers/serpapi.js";
+import { ProviderError } from "../providers/errors.js";
 import { TelegramNotifier } from "../services/telegram.js";
 import { buildTestMessage } from "../services/messages.js";
 import { TelegramBot } from "../services/bot.js";
@@ -24,6 +25,7 @@ import { humanizeDuration } from "../services/planner.js";
 import { renderPriceChart } from "./chart.js";
 import type { PriceContext } from "./views.js";
 import {
+  AVAILABLE_MARKETS,
   budgetFor,
   parseTrackerForm,
   valuesFromTracker,
@@ -64,23 +66,113 @@ const CRON_SCHEDULE = "7,22,37,52 * * * *";
 
 /** Paths reachable without a session. Everything else is denied by default. */
 const PUBLIC_PATHS = new Set(["/login", "/healthz"]);
+/** Browser forms are tiny; cap buffering so a public POST cannot consume the isolate. */
+const MAX_FORM_BODY_BYTES = 64 * 1024;
+
+function formText(form: FormData, key: string): string {
+  const value = form.get(key);
+  return typeof value === "string" ? value : "";
+}
+
+async function boundedFormData(request: Request): Promise<FormData | Response> {
+  const mediaType = (request.headers.get("Content-Type") ?? "")
+    .split(";", 1)[0]!
+    .trim()
+    .toLowerCase();
+  if (
+    mediaType !== "application/x-www-form-urlencoded" &&
+    mediaType !== "multipart/form-data"
+  ) {
+    return Response.json(
+      { detail: "Form submissions must use form-encoded data." },
+      { status: 415, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+
+  const declared = Number(request.headers.get("Content-Length"));
+  if (Number.isFinite(declared) && declared > MAX_FORM_BODY_BYTES) {
+    return Response.json(
+      { detail: "Form submission is too large." },
+      { status: 413, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+  if (request.body === null) return new FormData();
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > MAX_FORM_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        return Response.json(
+          { detail: "Form submission is too large." },
+          { status: 413, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      chunks.push(next.value);
+    }
+  } catch {
+    return Response.json(
+      { detail: "Form submission could not be read." },
+      { status: 400, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const replay = new Request(request.url, {
+      method: request.method,
+      headers: request.headers,
+      body: bytes,
+    });
+    return await replay.formData();
+  } catch {
+    return Response.json(
+      { detail: "Form submission is malformed." },
+      { status: 400, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+}
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
+  const response = await dispatchRequest(request, env);
+  return hardenResponse(request, response);
+}
+
+async function dispatchRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const { config, problems, usable } = loadConfig(env);
   // Behind Cloudflare this is always https; only local `wrangler dev` is http.
   const secure = url.protocol === "https:";
 
   if (url.pathname === "/healthz") {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return methodNotAllowed(["GET", "HEAD"]);
+    }
     return healthz(env, usable);
   }
 
   // Served before the setup gate and before the session guard: a stylesheet is
   // not private, and the setup page needs it to be legible.
   if (url.pathname === "/static/app.css") {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return methodNotAllowed(["GET", "HEAD"]);
+    }
     return staticAsset(request, APP_CSS, "text/css; charset=utf-8", APP_CSS_ETAG);
   }
   if (url.pathname === "/static/app.js") {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return methodNotAllowed(["GET", "HEAD"]);
+    }
     return staticAsset(request, APP_JS, "text/javascript; charset=utf-8", APP_JS_ETAG);
   }
 
@@ -104,6 +196,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
   const repo = new Repo(env.DB);
   if (url.pathname === "/telegram/webhook") {
+    if (request.method !== "POST") return methodNotAllowed(["POST"]);
     const { notifier, quota, search } = servicesFor({
       request,
       env,
@@ -123,9 +216,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }),
     });
   }
+  const sessionGeneration = (await repo.getSetting<string>("session_generation")) ?? "1";
   const session = await verifySessionToken(
     config.sessionSecret,
     readCookie(request, SESSION_COOKIE),
+    new Date(),
+    sessionGeneration,
   );
 
   if (!session && !PUBLIC_PATHS.has(url.pathname)) {
@@ -133,22 +229,38 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
 
   if (url.pathname === "/login") {
-    return session ? redirect("/") : loginRoute(request, repo, config, secure);
+    if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "POST") {
+      return methodNotAllowed(["GET", "HEAD", "POST"]);
+    }
+    return session
+      ? redirect("/")
+      : loginRoute(request, repo, config, secure, sessionGeneration);
   }
 
   if (!session) return redirect("/login");
   const csrf = await csrfTokenFor(config.sessionSecret, session.sid);
 
+  const allowed = authenticatedMethods(url.pathname);
+  if (allowed !== null && !allowed.includes(request.method)) return methodNotAllowed(allowed);
+  if (allowed === null && request.method !== "GET" && request.method !== "HEAD") {
+    return notFound({ request, env, repo, config, csrf });
+  }
+
   // --- mutations: CSRF-checked centrally --------------------------------
   if (request.method === "POST") {
-    if (url.pathname === "/logout") {
-      return redirect("/login", { "Set-Cookie": clearedSessionCookie(secure) });
-    }
-    const form = await request.formData();
-    if (!(await csrfValid(config.sessionSecret, session.sid, String(form.get("csrf_token") ?? "")))) {
+    const parsedBody = await boundedFormData(request);
+    if (parsedBody instanceof Response) return parsedBody;
+    const form = parsedBody;
+    if (!(await csrfValid(config.sessionSecret, session.sid, formText(form, "csrf_token")))) {
       return htmlResponse(
         layout(
-          { title: "Invalid request", nav: "none", appTimezone: config.appTimezone, authenticated: true },
+          {
+            title: "Invalid request",
+            nav: "none",
+            appTimezone: config.appTimezone,
+            authenticated: true,
+            csrfToken: csrf,
+          },
           errorPage({
             status: 400,
             detail:
@@ -158,6 +270,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         ),
         { status: 400 },
       );
+    }
+    if (url.pathname === "/logout") {
+      return redirect("/login", { "Set-Cookie": clearedSessionCookie(secure) });
     }
     return postRoute(url, form, { request, env, repo, config, csrf });
   }
@@ -179,6 +294,7 @@ async function loginRoute(
   repo: Repo,
   config: Ctx["config"],
   secure: boolean,
+  sessionGeneration: string,
 ): Promise<Response> {
   const page = (error: string | null, status = 200): Response =>
     htmlResponse(
@@ -195,8 +311,10 @@ async function loginRoute(
   const verdict = await checkThrottle(repo, key);
   if (verdict.locked) return page(verdict.message, 429);
 
-  const form = await request.formData();
-  const password = String(form.get("password") ?? "");
+  const parsedBody = await boundedFormData(request);
+  if (parsedBody instanceof Response) return parsedBody;
+  const form = parsedBody;
+  const password = formText(form, "password");
   const ok = await verifyPassword(password, config.authPasswordHash);
 
   if (!ok) {
@@ -207,25 +325,85 @@ async function loginRoute(
   }
 
   await clearAuthFailures(repo, key);
-  const token = await createSessionToken(config.sessionSecret);
+  const token = await createSessionToken(config.sessionSecret, new Date(), sessionGeneration);
   return redirect("/", { "Set-Cookie": sessionCookie(token, secure) });
+}
+
+function authenticatedMethods(pathname: string): string[] | null {
+  if (pathname === "/" || pathname === "/settings" || pathname === "/trackers/new") {
+    return ["GET", "HEAD"];
+  }
+  if (pathname === "/trackers") return ["GET", "HEAD", "POST"];
+  if (pathname === "/logout" || pathname === "/api/estimate") return ["POST"];
+  if (/^\/trackers\/\d+$/.test(pathname)) return ["GET", "HEAD", "POST"];
+  if (/^\/trackers\/\d+\/edit$/.test(pathname)) return ["GET", "HEAD"];
+  if (/^\/trackers\/\d+\/(check|toggle|delete|duplicate)$/.test(pathname)) return ["POST"];
+  if (
+    /^\/settings\/(test-message|discover-chat|sync-provider|revoke-sessions)$/.test(pathname) ||
+    /^\/settings\/telegram-webhook\/(enable|disable)$/.test(pathname)
+  ) return ["POST"];
+  return null;
+}
+
+function methodNotAllowed(allow: string[]): Response {
+  return Response.json(
+    { detail: "Method not allowed." },
+    {
+      status: 405,
+      headers: { Allow: allow.join(", "), "Cache-Control": "no-store" },
+    },
+  );
+}
+
+export function hardenResponse(request: Request, response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("Referrer-Policy", "same-origin");
+  headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  headers.set("Cross-Origin-Opener-Policy", "same-origin");
+  if (new URL(request.url).protocol === "https:") {
+    headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  if ((headers.get("Content-Type") ?? "").startsWith("text/html")) {
+    headers.set(
+      "Content-Security-Policy",
+      "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; " +
+        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    );
+  }
+  return new Response(request.method === "HEAD" ? null : response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 /** Serve an inlined asset with an ETag so repeat loads are a 304. */
 function staticAsset(request: Request, body: string, contentType: string, etag: string): Response {
   const tag = `"${etag}"`;
-  if (request.headers.get("If-None-Match") === tag) {
-    return new Response(null, { status: 304, headers: { ETag: tag } });
+  const immutable = new URL(request.url).searchParams.get("v") === etag;
+  const cacheControl = immutable
+    ? "public, max-age=31536000, immutable"
+    : "public, max-age=0, must-revalidate";
+  const validators = (request.headers.get("If-None-Match") ?? "")
+    .split(",")
+    .map((value) => value.trim());
+  if (
+    validators.some(
+      (value) => value === "*" || value === tag || value.replace(/^W\//, "") === tag,
+    )
+  ) {
+    return new Response(null, {
+      status: 304,
+      headers: { ETag: tag, "Cache-Control": cacheControl, "Content-Type": contentType },
+    });
   }
   return new Response(body, {
     headers: {
       "Content-Type": contentType,
       ETag: tag,
-      // A day is safe because the layout links these with a `?v=<hash>` of
-      // their own contents: a changed asset is a changed URL, so nothing has
-      // to expire for a deploy to be picked up. The path match ignores the
-      // query string, so the cached copy is still one object per asset.
-      "Cache-Control": "public, max-age=86400",
+      "Cache-Control": cacheControl,
       "X-Content-Type-Options": "nosniff",
     },
   });
@@ -332,7 +510,17 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
   const { repo, config } = ctx;
   const page = (title: string, nav: OperationalStatus extends never ? never : "dashboard" | "trackers" | "settings" | "none", body: Parameters<typeof layout>[1], flashes: Flash[] = []) =>
     htmlResponse(
-      layout({ title, nav, appTimezone: config.appTimezone, authenticated: true, flashes }, body),
+      layout(
+        {
+          title,
+          nav,
+          appTimezone: config.appTimezone,
+          authenticated: true,
+          flashes,
+          csrfToken: ctx.csrf,
+        },
+        body,
+      ),
     );
 
   if (url.pathname === "/") {
@@ -371,10 +559,16 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
     if (!tracker) return notFound(ctx);
     const isWindow =
       tracker.date_mode === DateMode.CUSTOM_WINDOW && tracker.current_config_version_id !== null;
-    const [observations, runs, alerts, candidates, candidateCoverage] = await Promise.all([
-      repo.observationsForTracker(tracker.id, 100),
+    const requestedPage = Number(url.searchParams.get("page") ?? "1");
+    const normalizedHistoryPage =
+      Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+    const historyPageSize = 50;
+    const [chartObservations, historyTotal, runs, alerts, candidates, candidateCoverage] =
+      await Promise.all([
+      repo.observationsForTracker(tracker.id, 200),
+      repo.countObservationsForTracker(tracker.id),
       repo.recentRuns(tracker.id, 15),
-      repo.recentAlerts(10),
+      repo.recentAlertsForTracker(tracker.id, 10),
       isWindow
         ? repo.candidatePrices(tracker.current_config_version_id!, tracker.coverage_cycle)
         : Promise.resolve([]),
@@ -382,12 +576,22 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
         ? repo.candidateCoverage(tracker.current_config_version_id!, tracker.coverage_cycle)
         : Promise.resolve(null),
     ]);
-    const { quota } = servicesFor(ctx);
+    const maxHistoryPage = Math.max(1, Math.ceil(historyTotal / historyPageSize));
+    const historyPage = Math.min(normalizedHistoryPage, maxHistoryPage);
+    const observations =
+      historyPage === 1
+        ? chartObservations.slice(0, historyPageSize)
+        : await repo.observationsForTracker(
+            tracker.id,
+            historyPageSize,
+            (historyPage - 1) * historyPageSize,
+          );
+    const { provider, quota } = servicesFor(ctx);
     const snapshot = await quota.snapshot();
 
     // Chart and context are computed from the best fare of each run so a
     // single scan that returned 25 offers reads as one point, not a cliff.
-    const bestOfRuns = observations
+    const bestOfRuns = chartObservations
       .filter((o) => o.is_best_of_run === 1)
       .sort((a, b) => a.observed_at.localeCompare(b.observed_at));
     const chartSvg = renderPriceChart(
@@ -417,15 +621,20 @@ async function getRoute(url: URL, ctx: Ctx): Promise<Response> {
       trackerDetailPage({
         tracker,
         observations,
+        latestObservation: chartObservations[0] ?? null,
         runs,
-        alerts: alerts.filter((a) => a.tracker_id === tracker.id),
+        alerts,
         csrf: ctx.csrf,
         tz: config.appTimezone,
         quotaBlocked: snapshot.remainingHard <= 0,
-        context: priceContextFor(tracker, observations, bestOfRuns),
+        context: priceContextFor(tracker, chartObservations, bestOfRuns),
         chartSvg: bestOfRuns.length > 0 ? chartSvg : null,
         candidates,
         candidateCoverage,
+        historyPage,
+        historyPageSize,
+        historyTotal,
+        maxProviderRequestsPerSearch: Math.max(1, provider.maxRequestCount ?? 1),
       }),
       flashesFrom(url),
     );
@@ -505,9 +714,6 @@ function priceContextFor(
 }
 
 // ------------------------------------------------------------- form helpers
-/** Markets offered in the form. Kept small: each one multiplies search cost. */
-const AVAILABLE_MARKETS = ["us", "gb", "ca", "au", "de", "jp"];
-
 /**
  * Render the tracker form with a budget preview computed from whatever the
  * operator has entered so far, so the cost of a window is visible before the
@@ -520,7 +726,7 @@ async function formView(
   errors: Record<string, string>,
   parsed?: ParsedTrackerForm,
 ): Promise<SafeHtml> {
-  const { quota } = servicesFor(ctx);
+  const { provider, quota } = servicesFor(ctx);
   const snapshot = await quota.snapshot();
   const effective = parsed ?? parseValuesForEstimate(values, ctx);
   return trackerFormPage({
@@ -529,8 +735,8 @@ async function formView(
     errors,
     csrf: ctx.csrf,
     today: todayIn(ctx.config.appTimezone),
-    budget: budgetFor(effective, snapshot),
-    availableMarkets: AVAILABLE_MARKETS,
+    budget: budgetFor(effective, snapshot, Math.max(1, provider.maxRequestCount ?? 1)),
+    availableMarkets: [...AVAILABLE_MARKETS],
   });
 }
 
@@ -562,8 +768,12 @@ function parseValuesForEstimate(
  */
 async function refuseIfOverBudget(ctx: Ctx, parsed: ParsedTrackerForm): Promise<boolean> {
   if (Object.keys(parsed.errors).length > 0) return false;
-  const { quota } = servicesFor(ctx);
-  const budget = budgetFor(parsed, await quota.snapshot());
+  const { provider, quota } = servicesFor(ctx);
+  const budget = budgetFor(
+    parsed,
+    await quota.snapshot(),
+    Math.max(1, provider.maxRequestCount ?? 1),
+  );
 
   if (budget.verdict.severity === "blocked") {
     parsed.errors["sampled_mode_ack"] = budget.verdict.detail;
@@ -590,27 +800,16 @@ async function persistCandidates(
   tracker: TrackerWithMarkets,
   parsed: ParsedTrackerForm,
 ): Promise<void> {
-  await ensureConfigVersion(ctx.repo, tracker);
-  const configVersionId = tracker.current_config_version_id;
-  if (configVersionId === null) return;
-
-  if (parsed.dateMode !== DateMode.CUSTOM_WINDOW) {
-    // Leaving a stale queue behind would let a later switch back to a window
-    // resume a sweep the operator never configured.
-    await ctx.repo.replaceCandidates(tracker.id, configVersionId, []);
-    return;
-  }
-
-  await ctx.repo.replaceCandidates(
-    tracker.id,
-    configVersionId,
-    parsed.candidates.map((pair) => ({
-      outbound: pair.outbound,
-      ret: pair.inbound,
-      nights: pair.nights,
-    })),
-  );
-  await ctx.repo.updateTrackerFields(tracker.id, { coverage_cycle: 1 });
+  await ensureConfigVersion(ctx.repo, tracker, {
+    candidates:
+      parsed.dateMode === DateMode.CUSTOM_WINDOW
+        ? parsed.candidates.map((pair) => ({
+            outbound: pair.outbound,
+            ret: pair.inbound,
+            nights: pair.nights,
+          }))
+        : [],
+  });
 }
 
 // -------------------------------------------------------------- POST routes
@@ -625,8 +824,13 @@ async function postRoute(url: URL, form: FormData, ctx: Ctx): Promise<Response> 
       defaultMarket: config.defaultMarket,
       today: todayIn(config.appTimezone),
     });
-    const { quota } = servicesFor(ctx);
-    const budget = budgetFor(parsed, await quota.snapshot());
+    const { provider, quota } = servicesFor(ctx);
+    const snapshot = await quota.snapshot();
+    const budget = budgetFor(
+      parsed,
+      snapshot,
+      Math.max(1, provider.maxRequestCount ?? 1),
+    );
     const dateErrors = [
       parsed.errors["outbound_date"],
       parsed.errors["return_date"],
@@ -644,12 +848,15 @@ async function postRoute(url: URL, form: FormData, ctx: Ctx): Promise<Response> 
         detail: budget.verdict.detail,
         severity: budget.verdict.severity,
         calls_per_scan: budget.estimate.callsPerScan,
-        remaining_safe: (await quota.snapshot()).remainingSafe,
-        monthly_limit: config.monthlySearchBudget,
+        max_calls_per_scan: budget.estimate.maxCallsPerScan,
+        max_requests_per_search: budget.estimate.maxRequestsPerSearch,
+        remaining_safe: snapshot.remainingSafe,
+        monthly_limit: snapshot.monthlyLimit,
         candidate_count: budget.candidateCount,
         market_count: budget.marketCount,
         scans_per_full_cycle: budget.estimate.scansPerFullCycle,
         calls_per_full_cycle: budget.estimate.callsPerFullCycle,
+        max_calls_per_full_cycle: budget.estimate.maxCallsPerFullCycle,
         full_cycle_duration: humanizeDuration(budget.estimate.fullCycleMinutes),
         suggestions: budget.verdict.suggestions,
         date_errors: dateErrors,
@@ -667,18 +874,23 @@ async function postRoute(url: URL, form: FormData, ctx: Ctx): Promise<Response> 
     if (Object.keys(parsed.errors).length > 0 || refusal) {
       return htmlResponse(
         layout(
-          { title: "New tracker", nav: "trackers", appTimezone: config.appTimezone, authenticated: true },
+          {
+            title: "New tracker",
+            nav: "trackers",
+            appTimezone: config.appTimezone,
+            authenticated: true,
+            csrfToken: ctx.csrf,
+          },
           await formView(ctx, null, parsed.values, parsed.errors, parsed),
         ),
         { status: 422 },
       );
     }
-    const id = await repo.insertTracker({
+    const id = await repo.insertTrackerWithMarkets({
       ...parsed.fields,
       created_at: nowIso(),
       updated_at: nowIso(),
-    });
-    await repo.setTrackerMarkets(id, parsed.markets);
+    }, parsed.markets);
     const tracker = await repo.getTracker(id);
     if (tracker) await persistCandidates(ctx, tracker, parsed);
     return redirect(`/trackers/${id}?flash=created`);
@@ -696,85 +908,129 @@ async function postRoute(url: URL, form: FormData, ctx: Ctx): Promise<Response> 
     if (Object.keys(parsed.errors).length > 0 || refusal) {
       return htmlResponse(
         layout(
-          { title: "Edit tracker", nav: "trackers", appTimezone: config.appTimezone, authenticated: true },
+          {
+            title: "Edit tracker",
+            nav: "trackers",
+            appTimezone: config.appTimezone,
+            authenticated: true,
+            csrfToken: ctx.csrf,
+          },
           await formView(ctx, tracker.id, parsed.values, parsed.errors, parsed),
         ),
         { status: 422 },
       );
     }
-    await repo.updateTrackerFields(tracker.id, parsed.fields);
-    await repo.setTrackerMarkets(tracker.id, parsed.markets);
-    const fresh = await repo.getTracker(tracker.id);
-    // Re-versioning here is what splits the comparison series when a
-    // comparison-relevant field changed; the candidate queue is rebuilt
-    // against whichever config version results.
-    if (fresh) await persistCandidates(ctx, fresh, parsed);
-    return redirect(`/trackers/${tracker.id}?flash=saved`);
+    const owner = `edit:${crypto.randomUUID().slice(0, 8)}`;
+    const locked = await repo.acquireTrackerLock(tracker.id, owner, config.schedulerLeaseTtlSeconds);
+    if (!locked) return redirect(`/trackers/${tracker.id}?flash=busy`);
+    try {
+      // Editing future dates is the explicit way to revive a completed trip;
+      // paused/error trackers otherwise retain their status until Resume.
+      parsed.fields["status"] =
+        tracker.status === TrackerStatus.COMPLETED ? TrackerStatus.ACTIVE : tracker.status;
+      await repo.updateTrackerWithMarkets(tracker.id, parsed.fields, parsed.markets);
+      const fresh = await repo.getTracker(tracker.id);
+      if (fresh) await persistCandidates(ctx, fresh, parsed);
+      return redirect(`/trackers/${tracker.id}?flash=saved`);
+    } finally {
+      await repo.releaseTrackerLock(tracker.id, owner);
+    }
   }
 
   const action = url.pathname.match(/^\/trackers\/(\d+)\/(check|toggle|delete|duplicate)$/);
   if (action) {
     const tracker = await repo.getTracker(Number(action[1]));
     if (!tracker) return notFound(ctx);
-
-    if (action[2] === "delete") {
-      await repo.deleteTracker(tracker.id);
-      return redirect("/trackers?flash=deleted");
-    }
-
-    if (action[2] === "toggle") {
-      const next =
-        tracker.status === TrackerStatus.PAUSED ? TrackerStatus.ACTIVE : TrackerStatus.PAUSED;
-      await repo.updateTrackerFields(tracker.id, { status: next });
-      return redirect(`/trackers/${tracker.id}?flash=${next}`);
-    }
-
-    if (action[2] === "duplicate") {
-      const copy: Record<string, unknown> = { ...(tracker as unknown as Record<string, unknown>) };
-      delete copy["id"];
-      delete copy["markets"];
-      Object.assign(copy, {
-        name: `${tracker.name} (copy)`,
-        status: TrackerStatus.PAUSED,
-        current_config_version_id: null,
-        series_started_at: null,
-        latest_price_cents: null,
-        latest_observation_id: null,
-        latest_observed_at: null,
-        low_price_cents: null,
-        low_observation_id: null,
-        low_observed_at: null,
-        last_threshold_met: 0,
-        next_run_at: null,
-        last_attempt_at: null,
-        last_success_at: null,
-        consecutive_failures: 0,
-        lock_owner: null,
-        lock_expires_at: null,
-        created_at: nowIso(),
-        updated_at: nowIso(),
-      });
-      const id = await repo.insertTracker(copy);
-      await repo.setTrackerMarkets(id, tracker.markets);
-      const fresh = await repo.getTracker(id);
-      if (fresh) await ensureConfigVersion(repo, fresh);
-      return redirect(`/trackers/${id}?flash=duplicated`);
-    }
-
-    // Manual check: same lock, quota, observation and alert path as the Cron
-    // tick, so the two cannot diverge in behaviour.
-    const owner = `manual:${crypto.randomUUID().slice(0, 8)}`;
+    const owner = `${action[2]}:${crypto.randomUUID().slice(0, 8)}`;
     const locked = await repo.acquireTrackerLock(tracker.id, owner, config.schedulerLeaseTtlSeconds);
     if (!locked) return redirect(`/trackers/${tracker.id}?flash=busy`);
     try {
+      if (action[2] === "delete") {
+        await repo.deleteTracker(tracker.id);
+        return redirect("/trackers?flash=deleted");
+      }
+
+      if (action[2] === "toggle") {
+        if (tracker.status === TrackerStatus.COMPLETED) {
+          return redirect(`/trackers/${tracker.id}?flash=completed_edit`);
+        }
+        const next =
+          tracker.status === TrackerStatus.ACTIVE ? TrackerStatus.PAUSED : TrackerStatus.ACTIVE;
+        await repo.updateTrackerFields(
+          tracker.id,
+          next === TrackerStatus.ACTIVE
+            ? {
+                status: next,
+                next_run_at: nowIso(),
+                consecutive_failures: 0,
+                last_error_category: null,
+                last_error_message: null,
+              }
+            : { status: next, next_run_at: null },
+        );
+        return redirect(`/trackers/${tracker.id}?flash=${next}`);
+      }
+
+      if (action[2] === "duplicate") {
+        const { id: _id, markets, ...stored } = tracker;
+        const copy: Record<string, unknown> = {
+          ...stored,
+          name: `${tracker.name} (copy)`,
+          status: TrackerStatus.PAUSED,
+          current_config_version_id: null,
+          series_started_at: null,
+          latest_price_cents: null,
+          latest_observation_id: null,
+          latest_observed_at: null,
+          low_price_cents: null,
+          low_observation_id: null,
+          low_observed_at: null,
+          last_threshold_met: 0,
+          next_run_at: null,
+          last_attempt_at: null,
+          last_success_at: null,
+          consecutive_failures: 0,
+          coverage_cycle: 1,
+          last_error_category: null,
+          last_error_message: null,
+          lock_owner: null,
+          lock_expires_at: null,
+          created_at: nowIso(),
+          updated_at: nowIso(),
+        };
+        const sourceCandidates =
+          tracker.date_mode === DateMode.CUSTOM_WINDOW && tracker.current_config_version_id !== null
+            ? await repo.candidateDefinitions(tracker.current_config_version_id)
+            : [];
+        const id = await repo.insertTrackerWithMarkets(copy, markets);
+        const fresh = await repo.getTracker(id);
+        if (fresh) {
+          await ensureConfigVersion(repo, fresh, {
+            candidates: tracker.date_mode === DateMode.CUSTOM_WINDOW ? sourceCandidates : [],
+          });
+        }
+        return redirect(`/trackers/${id}?flash=duplicated`);
+      }
+
+      // Manual check: same lock, quota, observation and alert path as Cron.
       const { search } = servicesFor(ctx);
-      await search.runTracker(tracker, RunTrigger.MANUAL, {
+      const result = await search.runTracker(tracker, RunTrigger.MANUAL, {
         forceRefresh: form.get("force_refresh") === "1",
       });
+      const flash =
+        result.providerCalls === 0 && result.cacheHits === 0 && result.workRemaining
+          ? "check_blocked"
+          : result.errors.length > 0 && result.successfulUnits === 0
+            ? "check_failed"
+            : result.workRemaining
+              ? "check_partial"
+              : result.offersFound === 0
+                ? "checked_no_results"
+                : "checked";
+      return redirect(`/trackers/${tracker.id}?flash=${flash}`);
     } finally {
       await repo.releaseTrackerLock(tracker.id, owner);
     }
-    return redirect(`/trackers/${tracker.id}?flash=checked`);
   }
 
   if (url.pathname === "/settings/test-message") {
@@ -789,13 +1045,49 @@ async function postRoute(url: URL, form: FormData, ctx: Ctx): Promise<Response> 
     return redirect(`/settings?flash=${result.ok ? "test_sent" : "test_failed"}`);
   }
 
+  if (url.pathname === "/settings/sync-provider") {
+    const { provider, quota } = servicesFor(ctx);
+    if (!provider.isConfigured()) return redirect("/settings?flash=provider_missing");
+    try {
+      const status = await provider.accountStatus();
+      await quota.syncFromProvider(status, null);
+      return redirect("/settings?flash=provider_synced");
+    } catch (error) {
+      const detail =
+        error instanceof ProviderError
+          ? error.guidance()
+          : "Provider account status could not be refreshed.";
+      await quota.syncFromProvider(null, detail.slice(0, 500));
+      console.error(
+        JSON.stringify({
+          event: "provider_account_sync_failed",
+          category: error instanceof ProviderError ? error.category : "internal",
+        }),
+      );
+      return redirect("/settings?flash=provider_sync_failed");
+    }
+  }
+
+  if (url.pathname === "/settings/revoke-sessions") {
+    await repo.setSetting("session_generation", crypto.randomUUID());
+    return redirect("/login", {
+      "Set-Cookie": clearedSessionCookie(new URL(ctx.request.url).protocol === "https:"),
+    });
+  }
+
   if (url.pathname === "/settings/discover-chat") {
     const { notifier } = servicesFor(ctx);
     const status = await operationalStatus(ctx);
     const discovery = await notifier.discoverChats();
     return htmlResponse(
       layout(
-        { title: "Settings", nav: "settings", appTimezone: config.appTimezone, authenticated: true },
+        {
+          title: "Settings",
+          nav: "settings",
+          appTimezone: config.appTimezone,
+          authenticated: true,
+          csrfToken: ctx.csrf,
+        },
         settingsPage({
           status,
           csrf: ctx.csrf,
@@ -858,7 +1150,27 @@ const FLASH_MESSAGES: Record<string, Flash> = {
   duplicated: { level: "success", message: "Tracker duplicated. The copy starts paused." },
   active: { level: "success", message: "Tracker resumed." },
   paused: { level: "info", message: "Tracker paused." },
+  completed_edit: {
+    level: "info",
+    message: "This trip is complete. Edit it with future dates to resume tracking.",
+  },
   checked: { level: "success", message: "Check complete." },
+  checked_no_results: {
+    level: "info",
+    message: "Check completed, but no eligible itinerary was returned.",
+  },
+  check_partial: {
+    level: "warning",
+    message: "Part of this check completed. Remaining date/market work will resume on the next run.",
+  },
+  check_blocked: {
+    level: "warning",
+    message: "No provider search ran because the configured quota allowance is currently unavailable.",
+  },
+  check_failed: {
+    level: "danger",
+    message: "The provider check failed. Stored price history was left unchanged; see the run details below.",
+  },
   busy: {
     level: "warning",
     message: "A check for this tracker is already running. Nothing was started twice.",
@@ -893,6 +1205,18 @@ const FLASH_MESSAGES: Record<string, Flash> = {
     message:
       "Set the bot token, chat id and TELEGRAM_WEBHOOK_SECRET before enabling commands.",
   },
+  provider_synced: {
+    level: "success",
+    message: "Provider allowance refreshed. Account-status reads do not consume fare searches.",
+  },
+  provider_sync_failed: {
+    level: "danger",
+    message: "Provider allowance could not be refreshed. The local hard cap remains in force.",
+  },
+  provider_missing: {
+    level: "warning",
+    message: "Set SERPAPI_API_KEY before refreshing provider allowance.",
+  },
 };
 
 function flashesFrom(url: URL): Flash[] {
@@ -904,7 +1228,13 @@ function flashesFrom(url: URL): Flash[] {
 function notFound(ctx: Ctx): Response {
   return htmlResponse(
     layout(
-      { title: "Not found", nav: "none", appTimezone: ctx.config.appTimezone, authenticated: true },
+      {
+        title: "Not found",
+        nav: "none",
+        appTimezone: ctx.config.appTimezone,
+        authenticated: true,
+        csrfToken: ctx.csrf,
+      },
       errorPage({ status: 404, detail: "That page does not exist." }),
     ),
     { status: 404 },

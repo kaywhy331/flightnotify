@@ -87,6 +87,12 @@ class Settings(BaseSettings):
     app_host: str = "127.0.0.1"
     app_port: int = 8000
     app_secret_key: str = ""
+    #: Set when TLS terminates at this process or at a trusted reverse proxy so
+    #: browser session cookies are never sent over plaintext HTTP.
+    app_https_only: bool = False
+    #: Comma-separated proxy IPs/networks whose Forwarded headers Uvicorn may
+    #: trust. The loopback default matches the safe local deployment.
+    trusted_proxy_ips: str = "127.0.0.1"
     database_url: str = "sqlite:///data/flightnotify.db"
     default_market: str = "us"
     default_currency: str = "USD"

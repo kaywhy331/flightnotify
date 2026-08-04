@@ -51,6 +51,8 @@
   var form = document.querySelector("form[data-estimate-url]");
   var box = document.getElementById("budget-estimate");
   var timer = null;
+  var estimateRequest = 0;
+  var estimateController = null;
 
   function scheduleEstimate() {
     if (!form || !box) return;
@@ -61,27 +63,45 @@
   function runEstimate() {
     var url = form.getAttribute("data-estimate-url");
     var payload = new FormData(form);
-    fetch(url, { method: "POST", body: payload, headers: { "X-Requested-With": "fetch" } })
+    var requestId = ++estimateRequest;
+    if (estimateController) estimateController.abort();
+    estimateController = typeof window.AbortController === "function"
+      ? new window.AbortController()
+      : null;
+    var options = {
+      method: "POST",
+      body: payload,
+      headers: { "X-Requested-With": "fetch" }
+    };
+    if (estimateController) options.signal = estimateController.signal;
+    fetch(url, options)
       .then(function (response) {
         if (!response.ok) throw new Error("estimate failed");
         return response.json();
       })
       .then(function (data) {
+        if (requestId !== estimateRequest) return;
         box.hidden = false;
         var lines = [];
+        var maxCallsPerScan = data.max_calls_per_scan || data.calls_per_scan;
         lines.push(
           "<p class='headline'>" + escapeHtml(data.headline) + "</p>",
           "<p>" + escapeHtml(data.detail) + "</p>",
-          "<p class='small'>Per scan: <strong>" + data.calls_per_scan +
-            "</strong> provider search(es). Available to automation now: <strong>" +
-            data.remaining_safe + "</strong> of " + data.monthly_limit + ".</p>"
+          "<p class='small'>Per scan: <strong>" + escapeHtml(data.calls_per_scan) +
+            "</strong> planned provider search(es). Retry safety requires room for up to <strong>" +
+            escapeHtml(maxCallsPerScan) + "</strong> calls. Available to automation now: <strong>" +
+            escapeHtml(data.remaining_safe) + "</strong> of " +
+            escapeHtml(data.monthly_limit) + ".</p>"
         );
         if (data.candidate_count) {
+          var maxCallsPerCycle = data.max_calls_per_full_cycle || data.calls_per_full_cycle;
           lines.push(
             "<p class='small'>Date combinations in this window: <strong>" +
-              data.candidate_count +
-              "</strong>. A full sweep takes " + data.scans_per_full_cycle +
-              " scans (" + data.calls_per_full_cycle + " searches).</p>"
+              escapeHtml(data.candidate_count) +
+              "</strong>. A full sweep takes " + escapeHtml(data.scans_per_full_cycle) +
+              " scans (" + escapeHtml(data.calls_per_full_cycle) +
+              " planned searches, up to " + escapeHtml(maxCallsPerCycle) +
+              " calls with retries).</p>"
           );
         }
         if (data.suggestions && data.suggestions.length) {
@@ -98,7 +118,8 @@
         var ack = document.getElementById("sampled-mode-row");
         if (ack) ack.hidden = data.severity === "ok";
       })
-      .catch(function () {
+      .catch(function (error) {
+        if (requestId !== estimateRequest || (error && error.name === "AbortError")) return;
         /* Leave the server-rendered estimate in place. */
       });
   }

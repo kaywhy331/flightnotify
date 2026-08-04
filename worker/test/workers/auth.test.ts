@@ -65,10 +65,33 @@ describe("password hashing", () => {
   });
 
   it("rejects malformed hashes rather than throwing", async () => {
-    for (const bad of ["", "nonsense", "pbkdf2$sha512$100000$a$b", "pbkdf2$sha256$10$a$b"]) {
+    const salt16 = "AAAAAAAAAAAAAAAAAAAAAA";
+    const hash32 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    for (const bad of [
+      "",
+      "nonsense",
+      "pbkdf2$sha512$100000$a$b",
+      "pbkdf2$sha256$10$a$b",
+      `pbkdf2$sha256$100000$$${hash32}`,
+      `pbkdf2$sha256$100000$c2FsdA$${hash32}`,
+      `pbkdf2$sha256$100000$${salt16}$`,
+      `pbkdf2$sha256$100000$${salt16}$aGFzaA`,
+      `pbkdf2$sha256$100000$${salt16}==$${hash32}`,
+    ]) {
       expect(parsePasswordHash(bad)).toBeNull();
       await expect(verifyPassword("x", bad)).resolves.toBe(false);
     }
+  });
+
+  it("reports a structurally unsafe hash as a blocking configuration problem", () => {
+    const result = loadConfig({
+      DB: env.DB,
+      SESSION_SECRET: SECRET,
+      AUTH_PASSWORD_HASH:
+        "pbkdf2$sha256$100000$c2FsdA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    } as Env);
+    expect(result.usable).toBe(false);
+    expect(result.problems.find((p) => p.key === "AUTH_PASSWORD_HASH")?.blocking).toBe(true);
   });
 });
 
@@ -96,6 +119,16 @@ describe("sessions", () => {
 
   it("rejects a missing token", async () => {
     await expect(verifySessionToken(SECRET, null)).resolves.toBeNull();
+  });
+
+  it("revokes a token when the server-side generation changes", async () => {
+    const token = await createSessionToken(SECRET, new Date(), "generation-a");
+    await expect(
+      verifySessionToken(SECRET, token, new Date(), "generation-a"),
+    ).resolves.not.toBeNull();
+    await expect(
+      verifySessionToken(SECRET, token, new Date(), "generation-b"),
+    ).resolves.toBeNull();
   });
 });
 
@@ -126,6 +159,44 @@ describe("login throttling", () => {
     const repo = new Repo(env.DB);
     await recordAuthFailure(repo, "few-failures");
     await expect(checkThrottle(repo, "few-failures")).resolves.toMatchObject({ locked: false });
+  });
+
+  it("starts a fresh failure window after a lock expires", async () => {
+    const repo = new Repo(env.DB);
+    const key = "expired-lock";
+    const start = new Date("2026-08-04T12:00:00Z");
+    for (let i = 0; i < 5; i += 1) await recordAuthFailure(repo, key, start);
+
+    const later = new Date(start.getTime() + 16 * 60_000);
+    await expect(checkThrottle(repo, key, later)).resolves.toMatchObject({ locked: false });
+    await recordAuthFailure(repo, key, later);
+    expect((await repo.getThrottle(key))?.fail_count).toBe(1);
+    await expect(checkThrottle(repo, key, later)).resolves.toMatchObject({ locked: false });
+  });
+
+  it("atomically resets a failure window even when its last failure was recent", async () => {
+    const repo = new Repo(env.DB);
+    const key = "expired-window";
+    const start = new Date("2026-08-04T12:00:00Z");
+    for (let i = 0; i < 3; i += 1) await recordAuthFailure(repo, key, start);
+    await recordAuthFailure(repo, key, new Date(start.getTime() + 14 * 60_000));
+
+    const later = new Date(start.getTime() + 16 * 60_000);
+    await expect(checkThrottle(repo, key, later)).resolves.toMatchObject({ locked: false });
+    await Promise.all([
+      recordAuthFailure(repo, key, later),
+      recordAuthFailure(repo, key, later),
+    ]);
+
+    expect((await repo.getThrottle(key))?.fail_count).toBe(2);
+    await expect(checkThrottle(repo, key, later)).resolves.toMatchObject({ locked: false });
+  });
+
+  it("counts concurrent failures atomically", async () => {
+    const repo = new Repo(env.DB);
+    await Promise.all(Array.from({ length: 5 }, () => recordAuthFailure(repo, "racing")));
+    expect((await repo.getThrottle("racing"))?.fail_count).toBe(5);
+    await expect(checkThrottle(repo, "racing")).resolves.toMatchObject({ locked: true });
   });
 
   it("stores a hashed key, never a raw address", async () => {
