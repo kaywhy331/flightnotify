@@ -17,7 +17,7 @@
 
 import type { Config } from "../env.js";
 import type { Repo } from "../db/repo.js";
-import type { TrackerWithMarkets } from "../db/rows.js";
+import type { FareObservationRow, TrackerWithMarkets } from "../db/rows.js";
 import {
   CacheStatus,
   CandidateStatus,
@@ -29,15 +29,18 @@ import {
   PriceScopeLabel,
   RunStatus,
   RunTrigger,
+  StopsPreference,
+  ThresholdBasis,
   TrackerStatus,
   type CabinValue,
+  type ErrorCategoryValue,
   type FlexDurationValue,
   type PriceScopeValue,
   type RunTriggerValue,
   type StopsPreferenceValue,
   type ThresholdBasisValue,
 } from "../domain/enums.js";
-import { evaluate } from "../domain/evaluation.js";
+import { comparableCents, evaluate } from "../domain/evaluation.js";
 import { itineraryFingerprint } from "../domain/fingerprints.js";
 import { ProviderError, ProviderMissingCredentialsError } from "../providers/errors.js";
 import type {
@@ -73,11 +76,12 @@ const RESUME_MINUTES = 16;
 
 interface QueryUnit {
   market: string;
-  endpoint: string;
+  endpoint: ProviderResult["endpoint"];
   fingerprint: string;
   outboundDate: string | null;
   returnDate: string | null;
   candidateId: number | null;
+  candidateCycle: number | null;
   run: () => Promise<ProviderResult>;
 }
 
@@ -89,9 +93,13 @@ export interface CheckResult extends CheckOutcome {
   offersFound: number;
   bestPriceCents: number | null;
   bestMarket: string | null;
+  bestObservationId: number | null;
+  successfulUnits: number;
   statusMessages: string[];
   skipped: boolean;
   alerts: { type: string; state: string; detail: string }[];
+  /** Last precise provider category, retained for tracker-level diagnostics. */
+  lastErrorCategory?: ErrorCategoryValue | null;
 }
 
 function emptyResult(batchId: string, trackerId: number): CheckResult {
@@ -104,6 +112,8 @@ function emptyResult(batchId: string, trackerId: number): CheckResult {
     offersFound: 0,
     bestPriceCents: null,
     bestMarket: null,
+    bestObservationId: null,
+    successfulUnits: 0,
     statusMessages: [],
     errors: [],
     alerts: [],
@@ -112,6 +122,7 @@ function emptyResult(batchId: string, trackerId: number): CheckResult {
     telegramFailures: 0,
     alertsSent: 0,
     workRemaining: false,
+    lastErrorCategory: null,
   };
 }
 
@@ -130,9 +141,13 @@ export class SearchService {
   async runTracker(
     tracker: TrackerWithMarkets,
     trigger: RunTriggerValue = RunTrigger.SCHEDULED,
-    options: { forceRefresh?: boolean; maxQueries?: number } = {},
+    options: {
+      forceRefresh?: boolean;
+      maxQueries?: number;
+      heartbeat?: () => Promise<boolean>;
+    } = {},
   ): Promise<CheckResult> {
-    const { repo, config, provider, quota } = this.deps;
+    const { repo, provider, quota } = this.deps;
     const batchId = crypto.randomUUID();
     const result = emptyResult(batchId, tracker.id);
 
@@ -212,22 +227,31 @@ export class SearchService {
 
     // Cache first: a cached unit costs no quota.
     const now = new Date();
-    const cached = new Map<string, string | null>();
+    const cached = new Map<string, ProviderResult | null>();
     const billable: QueryUnit[] = [];
     for (const unit of units) {
       const payload = options.forceRefresh ? null : await repo.cacheGet(unit.fingerprint, now);
-      cached.set(unit.fingerprint, payload);
-      if (payload === null) billable.push(unit);
+      const parsed = payload === null ? null : decodeCachedResult(payload, unit);
+      if (payload !== null && parsed === null) await repo.cacheDelete(unit.fingerprint);
+      cached.set(unit.fingerprint, parsed);
+      if (parsed === null) billable.push(unit);
     }
 
-    const { decision } = await quota.authorize(billable.length, trigger, now);
+    const maxAttempts = Math.max(1, provider.maxRequestCount ?? 1);
+    const { decision } = await quota.authorize(billable.length * maxAttempts, trigger, now);
     if (decision.reason) result.statusMessages.push(decision.reason);
-    const allowed = new Set(billable.slice(0, decision.granted).map((u) => u.fingerprint));
+    const allowedUnits = Math.floor(decision.granted / maxAttempts);
+    const allowed = new Set(billable.slice(0, allowedUnits).map((u) => u.fingerprint));
 
     for (const unit of units) {
-      const payload = cached.get(unit.fingerprint) ?? null;
-      if (payload !== null) {
-        await this.executeCached(tracker, batchId, trigger, unit, payload, result);
+      if (options.heartbeat && !(await options.heartbeat())) {
+        result.workRemaining = true;
+        result.errors.push("The scheduler lease expired; remaining work was left for a later tick.");
+        break;
+      }
+      const cachedResult = cached.get(unit.fingerprint) ?? null;
+      if (cachedResult !== null) {
+        await this.executeCached(tracker, batchId, trigger, unit, cachedResult, result);
         continue;
       }
       if (!allowed.has(unit.fingerprint)) {
@@ -237,6 +261,7 @@ export class SearchService {
           message: decision.reason || "The configured provider allowance is exhausted.",
           unit,
         });
+        result.workRemaining = true;
         continue;
       }
       await this.executeLive(tracker, batchId, trigger, unit, result, options.forceRefresh ?? false);
@@ -325,6 +350,7 @@ export class SearchService {
           outboundDate: tracker.outbound_date,
           returnDate: tracker.return_date,
           candidateId: null,
+          candidateCycle: null,
           run: () => provider.searchExact(query),
         });
       }
@@ -360,6 +386,7 @@ export class SearchService {
           outboundDate: null,
           returnDate: null,
           candidateId: null,
+          candidateCycle: null,
           run: () => provider.searchFlexible(query),
         });
       }
@@ -375,21 +402,30 @@ export class SearchService {
     const perRun = Math.max(1, tracker.candidates_per_run);
     // A window can straddle today: departures already flown are retired so the
     // sweep spends its budget only on pairs that can still be booked.
-    await repo.skipPastCandidates(configVersionId, todayIn(config.appTimezone));
+    const today = todayIn(config.appTimezone);
+    await repo.ensureCandidateMarkets(configVersionId, markets);
+    await repo.skipPastCandidates(configVersionId, today);
     let candidates = await repo.claimCandidates(configVersionId, tracker.coverage_cycle, perRun);
 
     if (candidates.length === 0) {
       // Cycle complete: start the next sweep so long-running windows keep
       // being refreshed rather than stopping once every pair is visited.
       const nextCycle = tracker.coverage_cycle + 1;
-      await repo.startNextCycle(configVersionId, nextCycle);
+      await repo.startNextCycle(configVersionId, nextCycle, today);
       await repo.updateTrackerFields(tracker.id, { coverage_cycle: nextCycle });
       tracker.coverage_cycle = nextCycle;
       candidates = await repo.claimCandidates(configVersionId, nextCycle, perRun);
     }
 
-    for (const candidate of candidates) {
-      for (const market of markets) {
+    const marketWork = await repo.pendingCandidateMarkets(
+      candidates.map((candidate) => candidate.id),
+      tracker.coverage_cycle,
+    );
+    const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+    for (const work of marketWork) {
+      const candidate = candidateById.get(work.candidate_id);
+      if (!candidate) continue;
+      const market = work.market;
         const query = {
           ...shared,
           market,
@@ -407,9 +443,9 @@ export class SearchService {
           outboundDate: candidate.outbound_date,
           returnDate: candidate.return_date,
           candidateId: candidate.id,
+          candidateCycle: tracker.coverage_cycle,
           run: () => provider.searchExact(query),
         });
-      }
     }
     return units;
   }
@@ -431,23 +467,41 @@ export class SearchService {
     result: CheckResult,
     forceRefresh: boolean,
   ): Promise<void> {
-    const { repo, config, quota } = this.deps;
+    const { repo, config, provider, quota } = this.deps;
     const runId = await this.openRun(tracker, batchId, trigger, unit,
       forceRefresh ? CacheStatus.FORCED : CacheStatus.MISS);
     result.runIds.push(runId);
+
+    const { decision, reservation } = await quota.reserveCalls(
+      Math.max(1, provider.maxRequestCount ?? 1),
+      trigger,
+    );
+    if (reservation === null) {
+      const message = decision.reason || "The configured provider allowance is exhausted.";
+      await repo.updateSearchRun(runId, {
+        completed_at: nowIso(),
+        status: RunStatus.QUOTA_BLOCKED,
+        cache_status: forceRefresh ? CacheStatus.FORCED : CacheStatus.MISS,
+        error_category: ErrorCategory.QUOTA_EXHAUSTED,
+        error_message: message,
+      });
+      result.statusMessages.push(message);
+      result.workRemaining = true;
+      return;
+    }
 
     let providerResult: ProviderResult;
     try {
       providerResult = await unit.run();
     } catch (error) {
-      // The call may well have been billed even though it failed, so the
-      // ledger is credited before the error is recorded.
-      await quota.recordCalls(unit.endpoint, runId, 1);
-      result.providerCalls += 1;
+      const requestCount = error instanceof ProviderError ? error.requestCount : 1;
+      await quota.finalizeReservation(reservation, unit.endpoint, runId, requestCount);
+      result.providerCalls += requestCount;
       result.providerFailures += 1;
 
       const category =
         error instanceof ProviderError ? error.category : ErrorCategory.INTERNAL;
+      result.lastErrorCategory = category;
       const message =
         error instanceof ProviderError
           ? error.guidance()
@@ -456,31 +510,38 @@ export class SearchService {
       await repo.updateSearchRun(runId, {
         completed_at: nowIso(),
         status: statusForCategory(category),
-        provider_request_count: 1,
+        provider_request_count: requestCount,
         error_category: category,
         error_message: message,
       });
-      await repo.updateTrackerFields(tracker.id, {
-        consecutive_failures: tracker.consecutive_failures + 1,
-        last_error_category: category,
-        last_error_message: message,
-      });
-      tracker.consecutive_failures += 1;
       result.errors.push(message);
-      if (unit.candidateId !== null) {
-        await repo.markCandidateChecked(unit.candidateId, CandidateStatus.FAILED, runId, null);
+      if (unit.candidateId !== null && unit.candidateCycle !== null) {
+        await repo.markCandidateMarketChecked(
+          unit.candidateId,
+          unit.market,
+          unit.candidateCycle,
+          CandidateStatus.FAILED,
+          runId,
+          null,
+        );
       }
       return;
     }
 
-    await quota.recordCalls(unit.endpoint, runId, providerResult.requestCount);
+    await quota.finalizeReservation(
+      reservation,
+      unit.endpoint,
+      runId,
+      providerResult.requestCount,
+    );
     result.providerCalls += providerResult.requestCount;
+    result.successfulUnits += 1;
 
     if (config.queryCacheTtlSeconds > 0) {
       await repo.cachePut(
         unit.fingerprint,
         unit.endpoint,
-        JSON.stringify(providerResult.rawExcerpt ?? {}),
+        encodeCachedResult(providerResult, unit),
         addSeconds(new Date(), config.queryCacheTtlSeconds),
         runId,
       );
@@ -494,35 +555,14 @@ export class SearchService {
     batchId: string,
     trigger: RunTriggerValue,
     unit: QueryUnit,
-    payload: string,
+    cachedResult: ProviderResult,
     result: CheckResult,
   ): Promise<void> {
-    const { repo, provider } = this.deps;
     const runId = await this.openRun(tracker, batchId, trigger, unit, CacheStatus.HIT);
     result.runIds.push(runId);
     result.cacheHits += 1;
-
-    try {
-      const parsed = provider.parsePayload(JSON.parse(payload), {
-        flexible: unit.endpoint === provider.flexibleEndpoint,
-        market: unit.market,
-        currency: tracker.currency,
-        queryFingerprint: unit.fingerprint,
-        outboundDate: unit.outboundDate,
-        returnDate: unit.returnDate,
-      });
-      await this.persistOffers(tracker, runId, unit, parsed, result);
-    } catch {
-      // A cached payload we can no longer parse is not a provider failure and
-      // must not be counted as one; drop it and let the next run refetch.
-      await repo.updateSearchRun(runId, {
-        completed_at: nowIso(),
-        status: RunStatus.NO_RESULTS,
-        cache_status: CacheStatus.HIT,
-        error_category: ErrorCategory.MALFORMED_RESPONSE,
-        error_message: "A cached response could not be read and was discarded.",
-      });
-    }
+    result.successfulUnits += 1;
+    await this.persistOffers(tracker, runId, unit, cachedResult, result);
   }
 
   private async openRun(
@@ -544,7 +584,7 @@ export class SearchService {
       return_date: unit.returnDate,
       query_fingerprint: unit.fingerprint,
       started_at: nowIso(),
-      status: RunStatus.SUCCESS,
+      status: RunStatus.RUNNING,
       cache_status: cacheStatus,
       coverage_cycle: tracker.coverage_cycle,
     });
@@ -586,28 +626,48 @@ export class SearchService {
     result: CheckResult,
   ): Promise<void> {
     const { repo, config } = this.deps;
-    const offers = [...providerResult.offers].sort((a, b) => a.priceCents - b.priceCents);
-    result.offersFound += offers.length;
+    const assessed = providerResult.offers
+      .map((offer) => ({ offer, ...eligibilityFor(tracker, offer) }))
+      .sort((a, b) => a.offer.priceCents - b.offer.priceCents);
+    result.offersFound += assessed.length;
 
-    if (offers.length === 0) {
+    if (assessed.length === 0) {
       await repo.updateSearchRun(runId, {
         completed_at: nowIso(),
         status: RunStatus.NO_RESULTS,
         provider_request_count: providerResult.requestCount,
         offers_found: 0,
       });
-      if (unit.candidateId !== null) {
-        await repo.markCandidateChecked(unit.candidateId, CandidateStatus.CHECKED, runId, null);
+      if (unit.candidateId !== null && unit.candidateCycle !== null) {
+        await repo.markCandidateMarketChecked(
+          unit.candidateId,
+          unit.market,
+          unit.candidateCycle,
+          CandidateStatus.CHECKED,
+          runId,
+          null,
+        );
       }
       return;
     }
 
-    const kept = offers.slice(0, MAX_STORED_OFFERS);
+    const bestEligible = assessed.find((entry) => entry.eligible) ?? null;
+    const kept = assessed.slice(0, MAX_STORED_OFFERS);
+    // Keep the response bounded without allowing cheaper provider-filter
+    // violations to crowd the first usable fare out of persistence.  The
+    // tracker summary and alert evaluation both require an observation id, so
+    // dropping that fare here would incorrectly turn a valid result into
+    // "no results" whenever 25 ineligible offers happened to precede it.
+    if (bestEligible !== null && !kept.includes(bestEligible)) {
+      kept[kept.length - 1] = bestEligible;
+      kept.sort((a, b) => a.offer.priceCents - b.offer.priceCents);
+    }
+    const bestIndex = bestEligible === null ? -1 : kept.indexOf(bestEligible);
     const observedAt = nowIso();
     const travelers = payingTravelersOf(tracker);
 
     const rows = await Promise.all(
-      kept.map(async (offer, index) => ({
+      kept.map(async ({ offer, eligible, reason }, index) => ({
         search_run_id: runId,
         tracker_id: tracker.id,
         config_version_id: tracker.current_config_version_id,
@@ -643,44 +703,94 @@ export class SearchService {
         search_link: offer.searchLink ?? providerResult.searchLink,
         market: offer.market,
         observed_at: observedAt,
-        eligible: 1,
-        is_best_of_run: index === 0 ? 1 : 0,
+        eligible: eligible ? 1 : 0,
+        exclusion_reason: reason,
+        is_best_of_run: index === bestIndex ? 1 : 0,
       })),
     );
 
     const ids = await repo.insertObservations(rows);
-    const bestId = ids[0] ?? null;
-    const bestPrice = kept[0]!.priceCents;
+    const bestId = bestIndex >= 0 ? (ids[bestIndex] ?? null) : null;
+
+    if (bestIndex < 0) {
+      await repo.updateSearchRun(runId, {
+        completed_at: nowIso(),
+        status: RunStatus.NO_RESULTS,
+        provider_request_count: providerResult.requestCount,
+        offers_found: assessed.length,
+        error_message:
+          "The provider returned itineraries, but none matched this tracker's currency or stops preference. They are stored and marked ineligible.",
+      });
+      if (unit.candidateId !== null && unit.candidateCycle !== null) {
+        await repo.markCandidateMarketChecked(
+          unit.candidateId,
+          unit.market,
+          unit.candidateCycle,
+          CandidateStatus.CHECKED,
+          runId,
+          null,
+        );
+      }
+      return;
+    }
+
+    const bestOffer = kept[bestIndex]!.offer;
+    const bestPrice = bestOffer.priceCents;
 
     await repo.updateSearchRun(runId, {
       completed_at: nowIso(),
       status: RunStatus.SUCCESS,
       provider_request_count: providerResult.requestCount,
-      offers_found: offers.length,
+      offers_found: assessed.length,
       best_observation_id: bestId,
     });
 
-    if (unit.candidateId !== null) {
-      await repo.markCandidateChecked(unit.candidateId, CandidateStatus.CHECKED, runId, bestPrice);
+    if (unit.candidateId !== null && unit.candidateCycle !== null) {
+      await repo.markCandidateMarketChecked(
+        unit.candidateId,
+        unit.market,
+        unit.candidateCycle,
+        CandidateStatus.CHECKED,
+        runId,
+        bestPrice,
+      );
     }
 
     if (result.bestPriceCents === null || bestPrice < result.bestPriceCents) {
       result.bestPriceCents = bestPrice;
-      result.bestMarket = kept[0]!.market;
-      this.bestObservationId = bestId;
+      result.bestMarket = bestOffer.market;
+      result.bestObservationId = bestId;
     }
   }
-
-  private bestObservationId: number | null = null;
 
   // ------------------------------------------------------------- finalize
   private async finalize(tracker: TrackerWithMarkets, result: CheckResult): Promise<void> {
     const { repo, config, alerts } = this.deps;
 
-    if (result.bestPriceCents === null || this.bestObservationId === null) {
-      // Nothing observed. Failures were already counted per unit; park the
-      // tracker only after a sustained run of them.
-      if (result.providerFailures > 0 && tracker.consecutive_failures >= FAILURE_LIMIT) {
+    if (result.bestPriceCents === null || result.bestObservationId === null) {
+      const wholeCheckFailed = result.providerFailures > 0 && result.successfulUnits === 0;
+      if (wholeCheckFailed) {
+        const nextFailures = tracker.consecutive_failures + 1;
+        const lastMessage = result.errors[result.errors.length - 1] ?? "Provider check failed.";
+        await repo.updateTrackerFields(tracker.id, {
+          consecutive_failures: nextFailures,
+          last_error_category: result.lastErrorCategory ?? ErrorCategory.PROVIDER_ERROR,
+          last_error_message: lastMessage,
+        });
+        tracker.consecutive_failures = nextFailures;
+        tracker.last_error_message = lastMessage;
+      } else if (result.successfulUnits > 0 && tracker.consecutive_failures > 0) {
+        await repo.updateTrackerFields(tracker.id, {
+          consecutive_failures: 0,
+          last_error_category: null,
+          last_error_message: null,
+        });
+        tracker.consecutive_failures = 0;
+      }
+
+      // Park only after failed tracker checks, never after several failed
+      // markets inside one check.
+      if (wholeCheckFailed && tracker.consecutive_failures >= FAILURE_LIMIT) {
         // Only the transition is announced. A tracker already parked that
         // fails again must stay silent, or a permanently invalid key would
         // message the owner on every tick -- and deploying this must send
@@ -694,27 +804,47 @@ export class SearchService {
       return;
     }
 
-    const observation = await repo.getObservation(this.bestObservationId);
+    const observation = await repo.getObservation(result.bestObservationId);
     if (observation === null) {
       await this.scheduleFollowUp(tracker, result);
       return;
     }
 
-    const series = await repo.seriesState(tracker.id, tracker.current_config_version_id);
-    // The new observations are already stored, so the pre-observation baseline
-    // is "were there any before this run" -- taken from the tracker summary,
-    // not from a count that now includes this run's own rows.
-    const hadBaseline = tracker.latest_price_cents !== null;
+    const [previousObservation, lowObservation] = await Promise.all([
+      tracker.latest_observation_id === null
+        ? Promise.resolve(null)
+        : repo.getObservation(tracker.latest_observation_id),
+      tracker.low_observation_id === null
+        ? Promise.resolve(null)
+        : repo.getObservation(tracker.low_observation_id),
+    ]);
+    const travelers = payingTravelersOf(tracker);
+    const basis = tracker.threshold_basis as ThresholdBasisValue;
+    const previousComparable = comparableObservationCents(
+      previousObservation,
+      tracker.latest_price_cents,
+      config.priceScope,
+      basis,
+      travelers,
+    );
+    const lowComparable = comparableObservationCents(
+      lowObservation,
+      tracker.low_price_cents,
+      config.priceScope,
+      basis,
+      travelers,
+    );
+    const hadBaseline = previousComparable !== null;
 
     const evaluation = evaluate({
       reportedCents: observation.price_amount_cents,
       priceScope: observation.price_scope as PriceScopeValue,
       thresholdCents: tracker.threshold_amount_cents,
-      thresholdBasis: tracker.threshold_basis as ThresholdBasisValue,
-      payingTravelers: payingTravelersOf(tracker),
+      thresholdBasis: basis,
+      payingTravelers: travelers,
       state: {
-        previousBestCents: tracker.latest_price_cents,
-        seriesLowCents: tracker.low_price_cents,
+        previousBestCents: previousComparable,
+        seriesLowCents: lowComparable,
         hasBaseline: hadBaseline,
         previouslyMetThreshold: tracker.last_threshold_met === 1,
       },
@@ -755,7 +885,10 @@ export class SearchService {
     for (const outcome of outcomes) {
       result.alerts.push({ type: outcome.alertType, state: outcome.state, detail: outcome.detail });
       if (outcome.state === DeliveryState.SENT) result.alertsSent += 1;
-      if (outcome.state === DeliveryState.FAILED) result.telegramFailures += 1;
+      if (
+        outcome.state === DeliveryState.FAILED ||
+        outcome.state === DeliveryState.UNCERTAIN
+      ) result.telegramFailures += 1;
     }
 
     // Soft heads-up: the fare just improved to within 5% above the threshold.
@@ -780,11 +913,13 @@ export class SearchService {
       });
       result.alerts.push({ type: outcome.alertType, state: outcome.state, detail: outcome.detail });
       if (outcome.state === DeliveryState.SENT) result.alertsSent += 1;
-      if (outcome.state === DeliveryState.FAILED) result.telegramFailures += 1;
+      if (
+        outcome.state === DeliveryState.FAILED ||
+        outcome.state === DeliveryState.UNCERTAIN
+      ) result.telegramFailures += 1;
     }
 
     await this.scheduleFollowUp(tracker, result);
-    void series;
   }
 
   /**
@@ -910,3 +1045,159 @@ function statusForCategory(category: string): string {
 }
 
 export { CoverageState, toIso };
+
+interface CachedResultEnvelope {
+  version: 1;
+  result: ProviderResult;
+}
+
+function encodeCachedResult(result: ProviderResult, unit: QueryUnit): string {
+  const envelope: CachedResultEnvelope = {
+    version: 1,
+    result: {
+      ...result,
+      endpoint: unit.endpoint,
+      market: unit.market,
+      queryFingerprint: unit.fingerprint,
+      outboundDate: unit.outboundDate,
+      returnDate: unit.returnDate,
+      requestCount: 0,
+      fromCache: true,
+    },
+  };
+  return JSON.stringify(envelope);
+}
+
+function decodeCachedResult(payload: string, unit: QueryUnit): ProviderResult | null {
+  try {
+    const value: unknown = JSON.parse(payload);
+    if (!isRecord(value) || value["version"] !== 1 || !isProviderResult(value["result"])) {
+      return null;
+    }
+    const result = value["result"];
+    if (
+      result.endpoint !== unit.endpoint ||
+      result.market !== unit.market ||
+      result.queryFingerprint !== unit.fingerprint
+    ) {
+      return null;
+    }
+    return { ...result, requestCount: 0, fromCache: true };
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNullableString(value: unknown): boolean {
+  return value === null || typeof value === "string";
+}
+
+function isNullableNumber(value: unknown): boolean {
+  return value === null || (typeof value === "number" && Number.isFinite(value));
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isNormalizedOffer(value: unknown): value is NormalizedOffer {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value["priceCents"] === "number" &&
+    Number.isFinite(value["priceCents"]) &&
+    value["priceCents"] >= 0 &&
+    typeof value["currency"] === "string" &&
+    typeof value["priceScope"] === "string" &&
+    typeof value["market"] === "string" &&
+    isNullableString(value["origin"]) &&
+    isNullableString(value["destination"]) &&
+    isNullableString(value["outboundDate"]) &&
+    isNullableString(value["returnDate"]) &&
+    isNullableString(value["departureTime"]) &&
+    isNullableString(value["arrivalTime"]) &&
+    isStringArray(value["airlines"]) &&
+    isStringArray(value["flightNumbers"]) &&
+    isNullableNumber(value["stops"]) &&
+    isNullableNumber(value["durationMinutes"]) &&
+    isNullableString(value["cabin"]) &&
+    Array.isArray(value["segments"]) &&
+    value["segments"].every(isRecord) &&
+    Array.isArray(value["layovers"]) &&
+    value["layovers"].every(isRecord) &&
+    isNullableString(value["bookingLink"]) &&
+    isNullableString(value["searchLink"])
+  );
+}
+
+function isProviderResult(value: unknown): value is ProviderResult {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value["endpoint"] === "string" &&
+    typeof value["market"] === "string" &&
+    typeof value["currency"] === "string" &&
+    typeof value["queryFingerprint"] === "string" &&
+    Array.isArray(value["offers"]) &&
+    value["offers"].every(isNormalizedOffer) &&
+    typeof value["responseAt"] === "string" &&
+    typeof value["requestCount"] === "number" &&
+    isNullableString(value["searchLink"]) &&
+    isNullableString(value["outboundDate"]) &&
+    isNullableString(value["returnDate"]) &&
+    isRecord(value["rawExcerpt"]) &&
+    typeof value["fromCache"] === "boolean"
+  );
+}
+
+function eligibilityFor(
+  tracker: TrackerWithMarkets,
+  offer: NormalizedOffer,
+): { eligible: boolean; reason: string | null } {
+  if (offer.currency.toUpperCase() !== tracker.currency.toUpperCase()) {
+    return {
+      eligible: false,
+      reason: `Provider returned ${offer.currency}, tracker compares in ${tracker.currency}.`,
+    };
+  }
+  if (offer.stops !== null) {
+    if (tracker.stops === StopsPreference.NONSTOP && offer.stops > 0) {
+      return { eligible: false, reason: "Has a stop; tracker requires nonstop." };
+    }
+    if (tracker.stops === StopsPreference.ONE_STOP_MAX && offer.stops > 1) {
+      return { eligible: false, reason: "More than one stop; tracker allows at most one." };
+    }
+  }
+  return { eligible: true, reason: null };
+}
+
+function comparableObservationCents(
+  observation: FareObservationRow | null,
+  fallbackReportedCents: number | null,
+  fallbackScope: PriceScopeValue,
+  basis: ThresholdBasisValue,
+  travelers: number,
+): number | null {
+  if (observation !== null) {
+    if (basis === ThresholdBasis.PARTY && observation.party_total_amount_cents !== null) {
+      return observation.party_total_amount_cents;
+    }
+    if (
+      basis === ThresholdBasis.PER_TRAVELER &&
+      observation.per_traveler_amount_cents !== null
+    ) {
+      return observation.per_traveler_amount_cents;
+    }
+    return comparableCents(
+      observation.price_amount_cents,
+      observation.price_scope as PriceScopeValue,
+      basis,
+      travelers,
+    );
+  }
+  return fallbackReportedCents === null
+    ? null
+    : comparableCents(fallbackReportedCents, fallbackScope, basis, travelers);
+}

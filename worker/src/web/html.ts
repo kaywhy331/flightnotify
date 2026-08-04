@@ -63,11 +63,21 @@ export interface LayoutOptions {
   setupError?: string | null;
   /** Hides the primary navigation on the sign-in page. */
   authenticated: boolean;
+  /** Present on authenticated pages so logout is a real CSRF-protected POST. */
+  csrfToken?: string;
 }
 
 /** Faithful port of templates/base.html, including its accessibility affordances. */
 export function layout(options: LayoutOptions, content: SafeHtml): SafeHtml {
-  const { title, nav, appTimezone, flashes = [], setupError = null, authenticated } = options;
+  const {
+    title,
+    nav,
+    appTimezone,
+    flashes = [],
+    setupError = null,
+    authenticated,
+    csrfToken,
+  } = options;
 
   const navBar = authenticated
     ? html`
@@ -77,6 +87,12 @@ export function layout(options: LayoutOptions, content: SafeHtml): SafeHtml {
           <a href="/settings" ${raw(nav === "settings" ? 'aria-current="page"' : "")}>Settings</a>
         </nav>
         <a class="btn btn-primary btn-small" href="/trackers/new">New tracker</a>
+        ${csrfToken
+          ? html`<form method="post" action="/logout" class="inline-fields">
+              <input type="hidden" name="csrf_token" value="${csrfToken}">
+              <button class="btn btn-small" type="submit">Sign out</button>
+            </form>`
+          : raw("")}
       `
     : raw("");
 
@@ -151,6 +167,12 @@ export function htmlResponse(body: SafeHtml, init: ResponseInit = {}): Response 
 }
 
 export function redirect(location: string, extraHeaders: Record<string, string> = {}): Response {
-  const headers = new Headers({ Location: location, ...extraHeaders });
+  const headers = new Headers({
+    Location: location,
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    ...extraHeaders,
+  });
   return new Response(null, { status: 303, headers });
 }

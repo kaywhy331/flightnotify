@@ -127,6 +127,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         workers=1,
         log_level=settings.log_level.lower(),
         access_log=args.reload,
+        proxy_headers=True,
+        forwarded_allow_ips=settings.trusted_proxy_ips,
     )
     return EXIT_OK
 

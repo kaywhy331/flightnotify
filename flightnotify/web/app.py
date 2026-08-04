@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -82,7 +83,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         secret_key=settings.resolved_secret_key(),
         session_cookie="flightnotify_session",
         same_site="lax",
-        https_only=False,  # bound to localhost by default
+        https_only=settings.app_https_only,
         max_age=14 * 24 * 3600,
     )
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -94,6 +95,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(dashboard.router)
     app.include_router(trackers.router)
     app.include_router(settings_routes.router)
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "same-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+        )
+        if settings.app_https_only:
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(
@@ -129,15 +145,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return templates.TemplateResponse(request, "error.html", context, status_code=422)
 
     @app.get("/healthz", include_in_schema=False)
-    async def healthz() -> dict[str, object]:
-        return {
-            "status": "error" if getattr(app.state, "startup_error", None) else "ok",
+    async def healthz() -> JSONResponse:
+        database_ok = False
+        if getattr(app.state, "startup_error", None) is None:
+            try:
+                with get_session_factory()() as session:
+                    # Connectivity alone is insufficient: a blank SQLite file
+                    # accepts SELECT 1 while every application route is broken.
+                    session.execute(text("SELECT 1 FROM trackers LIMIT 1"))
+                database_ok = True
+            except Exception:  # pragma: no cover - backend-specific failure text is not exposed
+                log.exception("health database probe failed")
+        healthy = getattr(app.state, "startup_error", None) is None and database_ok
+        payload = {
+            "status": "ok" if healthy else "error",
             "version": __version__,
+            "database": "connected" if database_ok else "unavailable",
             "scheduler_running": bool(
                 getattr(app.state, "scheduler", None) and app.state.scheduler.running
             ),
             "bot_running": bool(getattr(app.state, "bot", None) and app.state.bot.running),
         }
+        return JSONResponse(payload, status_code=200 if healthy else 503)
 
     return app
 

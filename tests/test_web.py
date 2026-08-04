@@ -95,8 +95,25 @@ def test_dashboard_empty_state_invites_the_first_tracker(client):
 
 
 def test_healthz(client):
-    payload = client.get("/healthz").json()
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    payload = response.json()
     assert payload["status"] == "ok"
+    assert payload["database"] == "connected"
+
+
+def test_healthz_is_unhealthy_when_startup_failed(client):
+    client.app.state.startup_error = "migration failed"
+    response = client.get("/healthz")
+    assert response.status_code == 503
+    assert response.json()["status"] == "error"
+
+
+def test_security_headers_are_applied(client):
+    response = client.get("/")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
 
 
 def test_static_css_is_served(client):

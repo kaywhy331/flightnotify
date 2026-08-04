@@ -21,6 +21,8 @@ export class ProviderError extends Error {
   /** Whether retrying the same request could plausibly succeed. */
   readonly retryable: boolean = false;
   readonly userMessage: string;
+  /** Exact HTTP attempts consumed before this error escaped the adapter. */
+  requestCount = 1;
 
   constructor(message: string, userMessage?: string) {
     super(message);

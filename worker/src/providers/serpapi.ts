@@ -141,10 +141,13 @@ const SAFE_PARAM_KEYS = [
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
+/** Bound decompressed provider JSON well below the Worker's memory ceiling. */
+const MAX_PROVIDER_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 /** The provider answered successfully but matched no itinerary. */
 export class NoResultsSignal extends Error {
   readonly providerMessage: string;
+  requestCount = 1;
 
   constructor(message: string) {
     super(message);
@@ -171,6 +174,45 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+async function boundedResponseText(response: Response): Promise<string> {
+  const declared = Number(response.headers.get("Content-Length"));
+  if (Number.isFinite(declared) && declared > MAX_PROVIDER_RESPONSE_BYTES) {
+    throw new ProviderMalformedResponseError(
+      "SerpApi returned a response larger than the 8 MiB safety limit.",
+    );
+  }
+  if (response.body === null) return "";
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > MAX_PROVIDER_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new ProviderMalformedResponseError(
+          "SerpApi returned a response larger than the 8 MiB safety limit.",
+        );
+      }
+      chunks.push(next.value);
+    }
+  } catch (error) {
+    if (error instanceof ProviderMalformedResponseError) throw error;
+    throw new ProviderNetworkError("SerpApi response body could not be read.");
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
 function asStringOrNull(value: unknown): string | null {
   if (typeof value === "string") return value;
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
@@ -191,7 +233,7 @@ function asBoolOrNull(value: unknown): boolean | null {
  * binary fraction ever multiplies its way into stored money.
  */
 export function priceCentsFrom(value: unknown): number | null {
-  if (value === null || value === undefined || typeof value === "boolean") return null;
+  if (typeof value !== "string" && typeof value !== "number") return null;
   const text = String(value).replace(/,/g, "").trim().replace(/^\+/, "");
   try {
     const cents = centsFromDecimalString(text);
@@ -199,6 +241,10 @@ export function priceCentsFrom(value: unknown): number | null {
   } catch {
     return null;
   }
+}
+
+function scalarText(value: unknown, fallback = ""): string {
+  return typeof value === "string" || typeof value === "number" ? String(value) : fallback;
 }
 
 /** Python's `int(value)`: truncating for numbers, integer literals only for strings. */
@@ -592,6 +638,10 @@ export class SerpApiProvider implements FareProvider {
     return EndpointType.GOOGLE_TRAVEL_EXPLORE;
   }
 
+  get maxRequestCount(): number {
+    return this.maxAttempts;
+  }
+
   // -- cache replay -------------------------------------------------------
   parsePayload(payload: unknown, options: ParsePayloadOptions): ProviderResult {
     if (options.flexible) {
@@ -648,8 +698,8 @@ export class SerpApiProvider implements FareProvider {
     const params = this.buildExactParams(query);
     const fingerprint = await queryFingerprint(EndpointType.GOOGLE_FLIGHTS, params);
     try {
-      const payload = await this.search(params);
-      return parseGoogleFlights(payload, {
+      const response = await this.search(params);
+      const result = parseGoogleFlights(response.payload, {
         market: query.market,
         currency: query.currency,
         queryFingerprint: fingerprint,
@@ -657,6 +707,7 @@ export class SerpApiProvider implements FareProvider {
         outboundDate: query.outboundDate,
         returnDate: query.returnDate,
       });
+      return { ...result, requestCount: response.requestCount };
     } catch (error) {
       if (error instanceof NoResultsSignal) {
         return this.emptyResult(
@@ -666,6 +717,7 @@ export class SerpApiProvider implements FareProvider {
           fingerprint,
           query.outboundDate,
           query.returnDate,
+          error.requestCount,
         );
       }
       throw error;
@@ -706,13 +758,14 @@ export class SerpApiProvider implements FareProvider {
     const params = this.buildFlexibleParams(query);
     const fingerprint = await queryFingerprint(EndpointType.GOOGLE_TRAVEL_EXPLORE, params);
     try {
-      const payload = await this.search(params);
-      return parseGoogleTravelExplore(payload, {
+      const response = await this.search(params);
+      const result = parseGoogleTravelExplore(response.payload, {
         market: query.market,
         currency: query.currency,
         queryFingerprint: fingerprint,
         priceScope: this.priceScope,
       });
+      return { ...result, requestCount: response.requestCount };
     } catch (error) {
       if (error instanceof NoResultsSignal) {
         return this.emptyResult(
@@ -722,6 +775,7 @@ export class SerpApiProvider implements FareProvider {
           fingerprint,
           null,
           null,
+          error.requestCount,
         );
       }
       throw error;
@@ -732,7 +786,7 @@ export class SerpApiProvider implements FareProvider {
   /** Free per SerpApi's documentation; never counted as a fare search. */
   async accountStatus(): Promise<AccountStatus> {
     this.requireCredentials();
-    const payload = await this.request("/account.json", {}, false);
+    const { payload } = await this.request("/account.json", {}, false);
     return {
       planName: asStringOrNull(payload["plan_name"]),
       searchesPerMonth: toInt(payload["searches_per_month"]),
@@ -746,7 +800,9 @@ export class SerpApiProvider implements FareProvider {
 
   // -- transport ----------------------------------------------------------
   /** Call `/search.json`. Throws `NoResultsSignal` for an empty match. */
-  private async search(params: ProviderParams): Promise<Record<string, unknown>> {
+  private async search(
+    params: ProviderParams,
+  ): Promise<{ payload: Record<string, unknown>; requestCount: number }> {
     return this.request("/search.json", params, true);
   }
 
@@ -754,13 +810,16 @@ export class SerpApiProvider implements FareProvider {
     path: string,
     params: ProviderParams,
     allowNoResults: boolean,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<{ payload: Record<string, unknown>; requestCount: number }> {
     let lastError: ProviderError | null = null;
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
-      let payload: Record<string, unknown>;
       try {
-        payload = await this.singleRequest(path, params);
+        const payload = await this.singleRequest(path, params);
+        return { payload: this.interpret(payload, allowNoResults), requestCount: attempt };
       } catch (error) {
+        if (error instanceof ProviderError || error instanceof NoResultsSignal) {
+          error.requestCount = attempt;
+        }
         const transient =
           error instanceof ProviderTimeoutError || error instanceof ProviderNetworkError;
         if (!transient || attempt >= this.maxAttempts) throw error;
@@ -768,7 +827,6 @@ export class SerpApiProvider implements FareProvider {
         await this.sleep(this.backoffMs(attempt));
         continue;
       }
-      return this.interpret(payload, allowNoResults);
     }
     throw lastError ?? new ProviderNetworkError("SerpApi request failed.");
   }
@@ -819,13 +877,14 @@ export class SerpApiProvider implements FareProvider {
     const status = response.status;
     let payload: Record<string, unknown> = {};
     try {
-      const body: unknown = await response.json();
+      const body: unknown = JSON.parse(await boundedResponseText(response));
       if (isRecord(body)) payload = body;
-    } catch {
+    } catch (error) {
+      if (error instanceof ProviderError) throw error;
       payload = {};
     }
 
-    const message = this.redact(String(payload["error"] ?? "").trim());
+    const message = this.redact(scalarText(payload["error"]).trim());
 
     if (status === 401 || (message && matches(message, INVALID_KEY_MARKERS))) {
       throw new ProviderAuthError(message || "SerpApi returned HTTP 401.");
@@ -851,10 +910,10 @@ export class SerpApiProvider implements FareProvider {
     allowNoResults: boolean,
   ): Record<string, unknown> {
     const metadata = payload["search_metadata"];
-    let message = this.redact(String(payload["error"] ?? "").trim());
+    let message = this.redact(scalarText(payload["error"]).trim());
     if (!message && isRecord(metadata) && metadata["status"] === "Error") {
       message = this.redact(
-        String(metadata["error"] ?? "SerpApi reported an error status.").trim(),
+        scalarText(metadata["error"], "SerpApi reported an error status.").trim(),
       );
     }
 
@@ -910,6 +969,7 @@ export class SerpApiProvider implements FareProvider {
     fingerprint: string,
     outboundDate: string | null,
     returnDate: string | null,
+    requestCount = 1,
   ): ProviderResult {
     return {
       endpoint,
@@ -918,7 +978,7 @@ export class SerpApiProvider implements FareProvider {
       queryFingerprint: fingerprint,
       offers: [],
       responseAt: toIso(new Date()),
-      requestCount: 1,
+      requestCount,
       searchLink: null,
       outboundDate,
       returnDate,

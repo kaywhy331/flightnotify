@@ -45,6 +45,7 @@ export const EndpointType = {
   AMADEUS_FLIGHT_DATES: "amadeus_flight_dates",
 } as const;
 export const RunStatus = {
+  RUNNING: "running",
   SUCCESS: "success",
   NO_RESULTS: "no_results",
   PROVIDER_ERROR: "provider_error",
@@ -93,8 +94,10 @@ export const AlertType = {
 } as const;
 export const DeliveryState = {
   PENDING: "pending",
+  SENDING: "sending",
   SENT: "sent",
   FAILED: "failed",
+  UNCERTAIN: "uncertain",
   SUPPRESSED_DUPLICATE: "suppressed_duplicate",
   SUPPRESSED_COOLDOWN: "suppressed_cooldown",
   SUPPRESSED_MIN_DROP: "suppressed_min_drop",
@@ -145,6 +148,7 @@ export const FLEX_DURATION_LABELS: Record<string, string> = {
   two_weeks: "About 2 weeks",
 };
 export const RUN_STATUS_LABELS: Record<string, string> = {
+  running: "In progress",
   success: "Success",
   no_results: "No results",
   provider_error: "Provider error",
@@ -155,8 +159,10 @@ export const RUN_STATUS_LABELS: Record<string, string> = {
 };
 export const DELIVERY_STATE_LABELS: Record<string, string> = {
   pending: "Pending",
+  sending: "Sending",
   sent: "Sent",
   failed: "Failed",
+  uncertain: "Delivery uncertain (not retried)",
   suppressed_duplicate: "Suppressed (duplicate)",
   suppressed_cooldown: "Suppressed (cooldown)",
   suppressed_min_drop: "Suppressed (below minimum drop)",

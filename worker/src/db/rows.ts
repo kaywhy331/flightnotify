@@ -112,6 +112,18 @@ export interface FlexibleDateCandidateRow {
   last_price_cents: number | null;
 }
 
+export interface FlexibleCandidateMarketRow {
+  id: number;
+  candidate_id: number;
+  market: string;
+  cycle: number;
+  status: string;
+  last_checked_at: string | null;
+  last_run_id: number | null;
+  check_count: number;
+  last_price_cents: number | null;
+}
+
 export interface SearchRunRow {
   id: number;
   tracker_id: number;
@@ -191,6 +203,10 @@ export interface AlertEventRow {
   response_meta: string | null;
   created_at: string;
   delivered_at: string | null;
+  retryable: SqlBool;
+  next_attempt_at: string | null;
+  claim_owner: string | null;
+  claim_expires_at: string | null;
 }
 
 export interface ProviderUsageRow {
@@ -218,6 +234,7 @@ export interface SchedulerStateRow {
   last_error: string | null;
   last_sweep_state: string | null;
   last_sweep_at: string | null;
+  last_cleanup_at: string | null;
 }
 
 export interface CronRunRow {
@@ -269,7 +286,7 @@ export interface TrackerWithMarkets extends TrackerRow {
   markets: string[];
 }
 
-export const toBool = (value: SqlBool | number | null | undefined): boolean => value === 1;
+export const toBool = (value: number | null | undefined): boolean => value === 1;
 export const fromBool = (value: boolean): SqlBool => (value ? 1 : 0);
 
 export function parseJsonColumn<T>(value: string | null): T | null {

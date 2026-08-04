@@ -38,6 +38,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Dependency consistency
+        run: pip check
+
       - name: Lint
         run: ruff check .
 
@@ -104,14 +107,26 @@ jobs:
       - name: Install
         run: npm ci
 
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
       - name: Generate binding types
         run: npx wrangler types
 
       - name: Build static assets (generated module, not committed)
         run: npm run build:static
 
+      - name: Generated static bundle is reproducible
+        run: |
+          cp src/web/static-assets.ts /tmp/flightnotify-static-assets.ts
+          npm run build:static
+          cmp /tmp/flightnotify-static-assets.ts src/web/static-assets.ts
+
       - name: Static types
         run: npx tsc --noEmit
+
+      - name: Type-aware lint
+        run: npm run lint
 
       - name: Unit tests (domain parity, provider, Telegram)
         run: npx vitest run
@@ -122,7 +137,7 @@ jobs:
           npx wrangler d1 migrations apply flightnotify --local
           npx wrangler d1 execute flightnotify --local \
             --command "SELECT value FROM schema_meta WHERE key='schema_version';" \
-            | grep -q '"value": "2"'
+            | grep -q '"value": "3"'
 
       - name: Integration tests (D1, Cron, lease recovery, auth)
         run: npx vitest run --config vitest.workers.config.ts
@@ -185,6 +200,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Validate Compose configuration
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
       - name: Build the image
         run: docker build -t flightnotify:ci .
       - name: Container starts and reports health without credentials

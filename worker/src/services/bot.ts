@@ -17,8 +17,7 @@ import {
   TrackerStatus,
   type RunTriggerValue,
 } from "../domain/enums.js";
-import { formatLocal, parseIsoOrNull } from "../time.js";
-import { nextRunAt } from "./tracker.js";
+import { formatLocal, nowIso, parseIsoOrNull } from "../time.js";
 import type { QuotaSnapshot } from "./quota.js";
 import type { CheckResult } from "./search.js";
 import { escapeHtml, type TelegramResult } from "./telegram.js";
@@ -33,6 +32,7 @@ import {
 
 const PROCESSING_ABANDON_MS = 5 * 60_000;
 const UPDATE_RETENTION_MS = 30 * 24 * 60 * 60_000;
+export const MAX_COMMAND_REPLY_ATTEMPTS = 3;
 
 interface TelegramCommand {
   name: string;
@@ -149,6 +149,21 @@ export class TelegramBot {
       return { updateId: row.update_id, outcome: "retry", retry: true };
     }
 
+    // A processing row with a prepared reply is a send whose D1 claim outlived
+    // its invocation. Telegram may already have accepted it, so never send the
+    // saved reply again after the claim expires.
+    if (row.reply_text !== null) {
+      console.warn(
+        JSON.stringify({ event: "telegram_reply_delivery_abandoned", update_id: row.update_id }),
+      );
+      await this.deps.repo.updateTelegramUpdate(row.update_id, {
+        state: "failed",
+        last_error:
+          "reply delivery claim expired; delivery may have succeeded and was not retried",
+      });
+      return { updateId: row.update_id, outcome: "failed", retry: false };
+    }
+
     console.warn(
       JSON.stringify({ event: "telegram_update_abandoned", update_id: row.update_id }),
     );
@@ -248,6 +263,28 @@ export class TelegramBot {
     reply: string,
     previousAttempts: number,
   ): Promise<BotHandleResult> {
+    if (previousAttempts >= MAX_COMMAND_REPLY_ATTEMPTS) {
+      await this.deps.repo.updateTelegramUpdate(updateId, {
+        state: "failed",
+        last_error: `Reply delivery stopped after ${MAX_COMMAND_REPLY_ATTEMPTS} attempts.`,
+      });
+      return { updateId, outcome: "failed", retry: false };
+    }
+    const claimed = await this.deps.repo.claimTelegramReplyDelivery(
+      updateId,
+      previousAttempts,
+      MAX_COMMAND_REPLY_ATTEMPTS,
+    );
+    if (!claimed) {
+      const current = await this.deps.repo.telegramUpdate(updateId);
+      if (current?.state === "failed") {
+        return { updateId, outcome: "failed", retry: false };
+      }
+      if (current?.state === "delivered" || current?.state === "ignored") {
+        return { updateId, outcome: "duplicate", retry: false };
+      }
+      return { updateId, outcome: "retry", retry: true };
+    }
     const attempts = previousAttempts + 1;
     let result: TelegramResult;
     try {
@@ -255,11 +292,12 @@ export class TelegramBot {
     } catch (error) {
       const label = error instanceof Error ? error.name : "Error";
       await this.deps.repo.updateTelegramUpdate(updateId, {
-        state: "ready",
+        state: "failed",
         delivery_attempts: attempts,
-        last_error: `network: ${label}`,
+        last_error:
+          `network: ${label}; delivery may have succeeded, so the saved reply was not retried`,
       });
-      return { updateId, outcome: "retry", retry: true };
+      return { updateId, outcome: "failed", retry: false };
     }
 
     if (result.ok) {
@@ -272,15 +310,24 @@ export class TelegramBot {
     }
 
     const detail = `${result.category}: ${result.userMessage}`.slice(0, 1000);
+    const ambiguous =
+      result.category === "timeout" ||
+      result.category === "network" ||
+      result.category === "ambiguous_response";
+    const retryable =
+      result.retryable && !ambiguous && attempts < MAX_COMMAND_REPLY_ATTEMPTS;
+    const exhausted = result.retryable && !ambiguous && !retryable;
     await this.deps.repo.updateTelegramUpdate(updateId, {
-      state: result.retryable ? "ready" : "failed",
+      state: retryable ? "ready" : "failed",
       delivery_attempts: attempts,
-      last_error: detail,
+      last_error: exhausted
+        ? `${detail} Reply delivery stopped after ${MAX_COMMAND_REPLY_ATTEMPTS} attempts.`
+        : detail,
     });
     return {
       updateId,
-      outcome: result.retryable ? "retry" : "failed",
-      retry: result.retryable,
+      outcome: retryable ? "retry" : "failed",
+      retry: retryable,
     };
   }
 
@@ -298,9 +345,9 @@ export class TelegramBot {
       case "/check":
         return this.check(command);
       case "/pause":
-        return this.pause(command.argument);
+        return this.pause(command);
       case "/resume":
-        return this.resume(command.argument);
+        return this.resume(command);
       default:
         return buildUnknownCommandMessage(command.name);
     }
@@ -376,7 +423,67 @@ export class TelegramBot {
       return escapeHtml(`No tracker with id ${trackerId}. Use /trackers to list them.`);
     }
 
-    const owner = `telegram:${command.updateId}:${crypto.randomUUID().slice(0, 8)}`;
+    return this.withTrackerLock(command, tracker, async () => {
+      const result = await this.deps.search.runTracker(tracker, RunTrigger.MANUAL);
+      return buildCheckResultMessage(tracker, result);
+    });
+  }
+
+  private async pause(command: TelegramCommand): Promise<string> {
+    const tracker = await this.trackerForWrite(command.argument, "/pause");
+    if (typeof tracker === "string") return tracker;
+    return this.withTrackerLock(command, tracker, async () => {
+      const current = await this.deps.repo.getTracker(tracker.id);
+      if (current === null) {
+        return escapeHtml(`No tracker with id ${tracker.id}. Use /trackers to list them.`);
+      }
+      if (current.status === TrackerStatus.COMPLETED) {
+        return escapeHtml(
+          `“${current.name.slice(0, 200)}” is complete because its travel dates passed. ` +
+            "Edit it with future dates in the web UI to resume.",
+        );
+      }
+      await this.deps.repo.updateTrackerFields(current.id, {
+        status: TrackerStatus.PAUSED,
+        next_run_at: null,
+      });
+      return escapeHtml(`“${current.name.slice(0, 200)}” paused. History is kept.`);
+    });
+  }
+
+  private async resume(command: TelegramCommand): Promise<string> {
+    const tracker = await this.trackerForWrite(command.argument, "/resume");
+    if (typeof tracker === "string") return tracker;
+    return this.withTrackerLock(command, tracker, async () => {
+      const current = await this.deps.repo.getTracker(tracker.id);
+      if (current === null) {
+        return escapeHtml(`No tracker with id ${tracker.id}. Use /trackers to list them.`);
+      }
+      if (current.status === TrackerStatus.COMPLETED) {
+        return escapeHtml(
+          `“${current.name.slice(0, 200)}” is complete because its travel dates passed. ` +
+            "Edit it with future dates in the web UI to resume.",
+        );
+      }
+      await this.deps.repo.updateTrackerFields(current.id, {
+        status: TrackerStatus.ACTIVE,
+        consecutive_failures: 0,
+        last_error_category: null,
+        last_error_message: null,
+        next_run_at: nowIso(),
+      });
+      return escapeHtml(`“${current.name.slice(0, 200)}” resumed.`);
+    });
+  }
+
+  private async withTrackerLock(
+    command: TelegramCommand,
+    tracker: TrackerWithMarkets,
+    action: () => Promise<string>,
+  ): Promise<string> {
+    const owner =
+      `telegram:${command.updateId}:${command.name.slice(1)}:` +
+      crypto.randomUUID().slice(0, 8);
     const locked = await this.deps.repo.acquireTrackerLock(
       tracker.id,
       owner,
@@ -384,35 +491,15 @@ export class TelegramBot {
     );
     if (!locked) {
       return escapeHtml(
-        `A check for “${tracker.name.slice(0, 200)}” is already running. Nothing was started twice.`,
+        `Another action for “${tracker.name.slice(0, 200)}” is already running. ` +
+          "Nothing was started twice.",
       );
     }
     try {
-      const result = await this.deps.search.runTracker(tracker, RunTrigger.MANUAL);
-      return buildCheckResultMessage(tracker, result);
+      return await action();
     } finally {
       await this.deps.repo.releaseTrackerLock(tracker.id, owner);
     }
-  }
-
-  private async pause(argument: string | null): Promise<string> {
-    const tracker = await this.trackerForWrite(argument, "/pause");
-    if (typeof tracker === "string") return tracker;
-    await this.deps.repo.updateTrackerFields(tracker.id, { status: TrackerStatus.PAUSED });
-    return escapeHtml(`“${tracker.name.slice(0, 200)}” paused. History is kept.`);
-  }
-
-  private async resume(argument: string | null): Promise<string> {
-    const tracker = await this.trackerForWrite(argument, "/resume");
-    if (typeof tracker === "string") return tracker;
-    await this.deps.repo.updateTrackerFields(tracker.id, {
-      status: TrackerStatus.ACTIVE,
-      consecutive_failures: 0,
-      last_error_category: null,
-      last_error_message: null,
-      next_run_at: nextRunAt(tracker.check_interval_minutes),
-    });
-    return escapeHtml(`“${tracker.name.slice(0, 200)}” resumed.`);
   }
 
   private async trackerForWrite(

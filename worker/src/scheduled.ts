@@ -27,6 +27,8 @@ import { nowIso } from "./time.js";
 /** How much Cron history is kept. Long enough to diagnose last month's tick. */
 const CRON_RUN_RETENTION_DAYS = 30;
 const TELEGRAM_UPDATE_RETENTION_DAYS = 30;
+const PROVIDER_CALL_RETENTION_HOURS = 72;
+const AUTH_THROTTLE_RETENTION_DAYS = 7;
 
 export interface CheckOutcome {
   providerCalls: number;
@@ -41,7 +43,11 @@ export interface CheckRunner {
   runTracker(
     tracker: TrackerWithMarkets,
     trigger: typeof RunTrigger.SCHEDULED | typeof RunTrigger.MANUAL,
-    options?: { forceRefresh?: boolean; maxQueries?: number },
+    options?: {
+      forceRefresh?: boolean;
+      maxQueries?: number;
+      heartbeat?: () => Promise<boolean>;
+    },
   ): Promise<CheckOutcome>;
   /** Re-attempt alerts that previously failed with a retryable error. */
   retryPendingAlerts(limit: number): Promise<{ delivered: number; failed: number }>;
@@ -158,6 +164,7 @@ export async function runScheduledTick(
     } else {
       let budget = config.maxQueriesPerTick;
       const handled: number[] = [];
+      let incompleteSelected = 0;
 
       for (const tracker of due) {
         if (budget <= 0) break;
@@ -175,21 +182,39 @@ export async function runScheduledTick(
         }
 
         try {
+          const renewed = await repo.renewSchedulerLease(
+            owner,
+            config.schedulerLeaseTtlSeconds,
+          );
+          if (!renewed) throw new Error("The scheduler lease expired before tracker work began.");
           const outcome = await runner.runTracker(tracker, RunTrigger.SCHEDULED, {
             maxQueries: budget,
+            heartbeat: async () => {
+              const schedulerOwned = await repo.renewSchedulerLease(
+                owner,
+                config.schedulerLeaseTtlSeconds,
+              );
+              if (!schedulerOwned) return false;
+              return repo.renewTrackerLock(
+                tracker.id,
+                owner,
+                config.schedulerLeaseTtlSeconds,
+              );
+            },
           });
           budget -= outcome.providerCalls;
           report.queriesExecuted += outcome.providerCalls;
           report.providerFailures += outcome.providerFailures;
           report.telegramFailures += outcome.telegramFailures;
           report.alertsSent += outcome.alertsSent;
-          report.trackersCompleted += 1;
-          if (outcome.workRemaining) report.workRemaining += 1;
+          if (outcome.workRemaining) incompleteSelected += 1;
+          else report.trackersCompleted += 1;
         } catch (error) {
           // A single tracker failing must not abort the tick: the others are
           // independent, and the failure is already classified and persisted
           // against the tracker by the runner.
           report.providerFailures += 1;
+          incompleteSelected += 1;
           report.detail = describeError(error);
         } finally {
           handled.push(tracker.id);
@@ -198,17 +223,25 @@ export async function runScheduledTick(
       }
 
       const stillDue = await repo.countDueTrackers(now, handled);
-      report.workRemaining = stillDue;
-      if (stillDue > 0 || budget <= 0) {
+      report.workRemaining = stillDue + incompleteSelected;
+      if (report.workRemaining > 0 || budget <= 0) {
         report.outcome = "partial";
         report.detail =
           report.detail ||
-          `Bounded tick: ${report.trackersCompleted} tracker(s) checked, ${stillDue} still due. ` +
+          `Bounded tick: ${report.trackersCompleted} tracker(s) completed, ` +
+            `${report.workRemaining} tracker(s) still have work. ` +
             "The next Cron invocation continues from here.";
       } else {
         report.outcome = "completed";
         report.detail = report.detail || `Checked ${report.trackersCompleted} tracker(s).`;
       }
+    }
+
+    // A busy installation still needs to drain explicit safe delivery retries.
+    if (due.length > 0) {
+      const retry = await runner.retryPendingAlerts(5);
+      report.alertsSent += retry.delivered;
+      report.telegramFailures += retry.failed;
     }
 
     if (options.digest) {
@@ -226,16 +259,46 @@ export async function runScheduledTick(
     // not permanent application data.
     // Wrapped because a tick that checked trackers and sent alerts must not be
     // reported as failed just because a DELETE did not land.
+    let housekeepingClaimed = false;
     try {
-      await repo.pruneCronRuns(
-        new Date(now.getTime() - CRON_RUN_RETENTION_DAYS * 24 * 60 * 60 * 1000),
+      housekeepingClaimed = await repo.claimHousekeeping(now);
+      if (housekeepingClaimed) {
+        const providerCutoff = new Date(
+          now.getTime() - PROVIDER_CALL_RETENTION_HOURS * 60 * 60 * 1000,
+        );
+        await repo.pruneCronRuns(
+          new Date(now.getTime() - CRON_RUN_RETENTION_DAYS * 24 * 60 * 60 * 1000),
+        );
+        await repo.pruneTelegramUpdates(
+          new Date(now.getTime() - TELEGRAM_UPDATE_RETENTION_DAYS * 24 * 60 * 60 * 1000),
+        );
+        await repo.pruneProviderCalls(providerCutoff);
+        await repo.pruneQuotaHours(providerCutoff.toISOString().slice(0, 13));
+        await repo.cachePrune(now);
+        await repo.pruneAuthThrottle(
+          new Date(now.getTime() - AUTH_THROTTLE_RETENTION_DAYS * 24 * 60 * 60 * 1000),
+          now,
+        );
+      }
+    } catch (error) {
+      // A claim records the attempt time before any DELETE runs. Give that
+      // exact claim back on failure so the next tick really can retry rather
+      // than waiting a full retention interval.
+      if (housekeepingClaimed) {
+        try {
+          await repo.releaseHousekeepingClaim(now);
+        } catch (releaseError) {
+          console.error(
+            JSON.stringify({
+              event: "housekeeping_claim_release_failed",
+              detail: describeError(releaseError),
+            }),
+          );
+        }
+      }
+      console.error(
+        JSON.stringify({ event: "housekeeping_failed", detail: describeError(error) }),
       );
-      await repo.pruneTelegramUpdates(
-        new Date(now.getTime() - TELEGRAM_UPDATE_RETENTION_DAYS * 24 * 60 * 60 * 1000),
-      );
-    } catch {
-      // Intentionally silent: the next tick tries again, and nothing downstream
-      // depends on the old rows being gone.
     }
 
     await repo.recordSweepState(report.outcome === "completed" ? "complete" : report.outcome);
@@ -245,26 +308,38 @@ export async function runScheduledTick(
     report.detail = describeError(error);
     return report;
   } finally {
-    await repo.finishCronRun(cronRunId, {
-      outcome: report.outcome,
-      detail: report.detail.slice(0, 2000),
-      lease_acquired: report.leaseAcquired ? 1 : 0,
-      lease_owner: owner,
-      trackers_selected: report.trackersSelected,
-      trackers_completed: report.trackersCompleted,
-      queries_executed: report.queriesExecuted,
-      provider_failures: report.providerFailures,
-      telegram_failures: report.telegramFailures,
-      alerts_sent: report.alertsSent,
-      work_remaining: report.workRemaining,
-    });
-    // Released explicitly so the next tick starts immediately rather than
-    // waiting out the TTL. The TTL only matters when a Worker is killed
-    // mid-tick and never reaches this line.
-    await repo.releaseSchedulerLease(
-      owner,
-      report.outcome === "error" ? report.detail.slice(0, 500) : null,
-    );
+    try {
+      await repo.finishCronRun(cronRunId, {
+        outcome: report.outcome,
+        detail: report.detail.slice(0, 2000),
+        lease_acquired: report.leaseAcquired ? 1 : 0,
+        lease_owner: owner,
+        trackers_selected: report.trackersSelected,
+        trackers_completed: report.trackersCompleted,
+        queries_executed: report.queriesExecuted,
+        provider_failures: report.providerFailures,
+        telegram_failures: report.telegramFailures,
+        alerts_sent: report.alertsSent,
+        work_remaining: report.workRemaining,
+      });
+    } catch (error) {
+      console.error(
+        JSON.stringify({ event: "cron_run_finalize_failed", detail: describeError(error) }),
+      );
+    } finally {
+      // A failed history write must never skip lease release and block the
+      // next invocation for the full TTL.
+      try {
+        await repo.releaseSchedulerLease(
+          owner,
+          report.outcome === "error" ? report.detail.slice(0, 500) : null,
+        );
+      } catch (error) {
+        console.error(
+          JSON.stringify({ event: "scheduler_lease_release_failed", detail: describeError(error) }),
+        );
+      }
+    }
   }
 }
 

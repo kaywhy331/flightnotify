@@ -37,10 +37,15 @@ export interface PlanInput {
 }
 
 export interface PlanEstimate {
+  /** Expected billable calls when each logical search succeeds first try. */
   callsPerScan: number;
+  /** Capacity required before a scan starts, including bounded retries. */
+  maxCallsPerScan: number;
+  maxRequestsPerSearch: number;
   scansRemainingThisMonth: number;
   callsRemainingThisMonth: number;
   callsPerFullCycle: number;
+  maxCallsPerFullCycle: number;
   scansPerFullCycle: number;
   callsPer30Days: number;
   hasCoverageCycle: boolean;
@@ -52,8 +57,15 @@ export function hoursRemainingInMonth(now: Date = new Date()): number {
   return Math.max(0, (monthEnd(now).getTime() - now.getTime()) / 3_600_000);
 }
 
-export function estimate(plan: PlanInput, nowHoursLeft?: number): PlanEstimate {
+export function estimate(
+  plan: PlanInput,
+  nowHoursLeft?: number,
+  maxRequestsPerSearch = 1,
+): PlanEstimate {
   const markets = Math.max(1, plan.marketCount);
+  const requestCapacity = Number.isFinite(maxRequestsPerSearch)
+    ? Math.max(1, Math.trunc(maxRequestsPerSearch))
+    : 1;
 
   const perScanUnits =
     plan.dateMode === DateMode.CUSTOM_WINDOW ? Math.max(1, plan.candidatesPerRun) : 1;
@@ -70,9 +82,12 @@ export function estimate(plan: PlanInput, nowHoursLeft?: number): PlanEstimate {
 
   return {
     callsPerScan,
+    maxCallsPerScan: callsPerScan * requestCapacity,
+    maxRequestsPerSearch: requestCapacity,
     scansRemainingThisMonth: scansLeft,
     callsRemainingThisMonth: scansLeft * callsPerScan,
     callsPerFullCycle: callsPerCycle,
+    maxCallsPerFullCycle: callsPerCycle * requestCapacity,
     scansPerFullCycle: scansPerCycle,
     callsPer30Days: Math.floor((30 * 24) / intervalHours) * callsPerScan,
     hasCoverageCycle: scansPerCycle > 1,
@@ -111,13 +126,18 @@ export function assess(args: AssessArgs): BudgetVerdict {
   }
   suggestions.push("Check less often.");
 
-  if (est.callsPerScan > remainingHard) {
+  if (est.maxCallsPerScan > remainingHard) {
+    const scanNeed =
+      est.maxCallsPerScan === est.callsPerScan
+        ? `One scan needs ${est.callsPerScan} provider searches`
+        : `One scan plans ${est.callsPerScan} provider searches and needs temporary ` +
+          `capacity for up to ${est.maxCallsPerScan} calls so bounded retries cannot overspend`;
     return {
       fits: false,
       severity: "blocked",
       headline: "A single scan does not fit the remaining allowance.",
       detail:
-        `One scan needs ${est.callsPerScan} provider searches but only ${remainingHard} ` +
+        `${scanNeed}, but only ${remainingHard} ` +
         `remain this period (cap ${monthlyLimit}).`,
       suggestions,
     };

@@ -99,10 +99,17 @@ export function parsePasswordHash(stored: string): ParsedHash | null {
   if (!Number.isInteger(iterations) || iterations < 1000) return null;
   if (iterations > MAX_PBKDF2_ITERATIONS) return null;
   try {
+    const salt = base64UrlDecode(saltText!);
+    const hash = base64UrlDecode(hashText!);
+    // `hash-password` emits a 128-bit salt and a full SHA-256 result. Refuse
+    // empty, truncated and non-canonical encodings before deriveBits sees a
+    // zero-length output or an unexpectedly weak salt.
+    if (salt.length !== 16 || hash.length !== 32) return null;
+    if (base64UrlEncode(salt) !== saltText || base64UrlEncode(hash) !== hashText) return null;
     return {
       iterations,
-      salt: base64UrlDecode(saltText!),
-      hash: base64UrlDecode(hashText!),
+      salt,
+      hash,
     };
   } catch {
     return null;
@@ -146,13 +153,20 @@ interface SessionPayload {
   exp: number;
   /** Random per-session id; also seeds the CSRF token. */
   sid: string;
+  /** Server-side generation used to revoke every outstanding session. */
+  gen: string;
 }
 
-export async function createSessionToken(secret: string, now = new Date()): Promise<string> {
+export async function createSessionToken(
+  secret: string,
+  now = new Date(),
+  generation = "1",
+): Promise<string> {
   const payload: SessionPayload = {
     iat: Math.floor(now.getTime() / 1000),
     exp: Math.floor(addSeconds(now, SESSION_TTL_SECONDS).getTime() / 1000),
     sid: base64UrlEncode(crypto.getRandomValues(new Uint8Array(16))),
+    gen: generation,
   };
   const body = base64UrlEncode(encoder.encode(JSON.stringify(payload)));
   return `${body}.${await hmac(secret, body)}`;
@@ -162,6 +176,7 @@ export async function verifySessionToken(
   secret: string,
   token: string | null,
   now = new Date(),
+  generation = "1",
 ): Promise<SessionPayload | null> {
   if (!token) return null;
   const [body, signature] = token.split(".");
@@ -174,6 +189,10 @@ export async function verifySessionToken(
     const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(body))) as SessionPayload;
     if (typeof payload.exp !== "number" || payload.exp * 1000 <= now.getTime()) return null;
     if (typeof payload.sid !== "string" || payload.sid === "") return null;
+    // Tokens issued before generations existed belong to generation 1. This
+    // avoids a surprise logout on upgrade while still making the first revoke
+    // action invalidate them.
+    if ((payload.gen ?? "1") !== generation) return null;
     return payload;
   } catch {
     return null;
@@ -266,15 +285,21 @@ export async function checkThrottle(
       message: `Too many failed sign-in attempts. Try again in ${Math.ceil(seconds / 60)} minute(s).`,
     };
   }
+  // Do not delete an expired row here. The next failed attempt resets its
+  // window inside Repo.recordAuthFailure's atomic UPSERT; a read-then-delete
+  // would let two concurrent attempts erase one another's newly written count.
+  // A successful sign-in clears the row after password verification below.
   return { locked: false, retryAfterSeconds: 0, message: "" };
 }
 
 export async function recordAuthFailure(repo: Repo, key: string, now = new Date()): Promise<void> {
-  const row = await repo.getThrottle(key);
-  const failures = (row?.fail_count ?? 0) + 1;
-  const lockedUntil =
-    failures >= MAX_FAILURES ? toIso(addSeconds(now, LOCKOUT_SECONDS)) : row?.locked_until ?? null;
-  await repo.recordAuthFailure(key, lockedUntil);
+  await repo.recordAuthFailure(
+    key,
+    MAX_FAILURES,
+    toIso(addSeconds(now, LOCKOUT_SECONDS)),
+    toIso(addSeconds(now, -LOCKOUT_SECONDS)),
+    toIso(now),
+  );
 }
 
 export async function clearAuthFailures(repo: Repo, key: string): Promise<void> {

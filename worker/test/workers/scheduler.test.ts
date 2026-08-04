@@ -7,7 +7,7 @@
  */
 
 import { env } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Repo } from "../../src/db/repo.js";
 import { loadConfig, type Env } from "../../src/env.js";
@@ -90,7 +90,7 @@ beforeEach(async () => {
   await env.DB.exec("DELETE FROM tracker_markets");
   await env.DB.exec("DELETE FROM trackers");
   await env.DB.exec(
-    "UPDATE scheduler_state SET lock_owner = NULL, lock_expires_at = NULL, tick_count = 0",
+    "UPDATE scheduler_state SET lock_owner = NULL, lock_expires_at = NULL, tick_count = 0, last_cleanup_at = NULL",
   );
 });
 
@@ -99,7 +99,7 @@ describe("migrations", () => {
     const row = await env.DB.prepare(
       "SELECT value FROM schema_meta WHERE key = 'schema_version'",
     ).first<{ value: string }>();
-    expect(row?.value).toBe("2");
+    expect(row?.value).toBe("3");
 
     const health = await repo().health();
     expect(health.ok).toBe(true);
@@ -271,6 +271,15 @@ describe("scheduled tick", () => {
     expect(state?.lock_owner).toBeNull();
   });
 
+  it("renews only leases that are still live and owned by the caller", async () => {
+    const r = repo();
+    const start = new Date("2026-08-04T12:00:00Z");
+    expect(await r.acquireSchedulerLease("owner-a", 30, start)).toBe(true);
+    expect(await r.renewSchedulerLease("owner-b", 30, new Date(start.getTime() + 10_000))).toBe(false);
+    expect(await r.renewSchedulerLease("owner-a", 30, new Date(start.getTime() + 10_000))).toBe(true);
+    expect(await r.renewSchedulerLease("owner-a", 30, new Date(start.getTime() + 41_000))).toBe(false);
+  });
+
   it("bounds work per invocation and reports what is still due", async () => {
     for (let i = 0; i < 5; i += 1) await insertTracker({ name: `t${i}` });
 
@@ -280,6 +289,15 @@ describe("scheduled tick", () => {
     expect(runner.calls).toHaveLength(2);
     expect(report.outcome).toBe("partial");
     expect(report.workRemaining).toBeGreaterThan(0);
+  });
+
+  it("retains selected tracker work in the work-remaining count", async () => {
+    await insertTracker();
+    const report = await runScheduledTick(repo(), configFor(), fakeRunner({ workRemaining: true }));
+
+    expect(report.outcome).toBe("partial");
+    expect(report.trackersCompleted).toBe(0);
+    expect(report.workRemaining).toBe(1);
   });
 
   it("records a failing tracker without aborting the whole tick", async () => {
@@ -310,6 +328,8 @@ describe("scheduled tick", () => {
     const report = await runScheduledTick(repo(), configFor(), runner);
     expect(report.providerFailures).toBe(1);
     expect(report.trackersCompleted).toBe(1);
+    expect(report.workRemaining).toBe(1);
+    expect(report.outcome).toBe("partial");
 
     const state = await repo().schedulerState();
     expect(state?.lock_owner).toBeNull();
@@ -331,6 +351,18 @@ describe("scheduled tick", () => {
     expect(report.outcome).toBe("no_work");
     expect(retried).toBe(1);
     expect(report.alertsSent).toBe(1);
+  });
+
+  it("releases a failed housekeeping claim so the next tick retries immediately", async () => {
+    const r = repo();
+    const now = new Date("2026-08-04T12:00:00Z");
+    vi.spyOn(r, "pruneCronRuns").mockRejectedValueOnce(new Error("temporary cleanup failure"));
+
+    await runScheduledTick(r, configFor(), fakeRunner(), { now });
+    expect((await r.schedulerState())?.last_cleanup_at).toBeNull();
+
+    await runScheduledTick(r, configFor(), fakeRunner(), { now });
+    expect((await r.schedulerState())?.last_cleanup_at).toBe(toIso(now));
   });
 });
 

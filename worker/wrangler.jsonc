@@ -3,6 +3,7 @@
   "name": "flightnotify",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
 
   // Static assets are inlined into the Worker (src/web/static-assets.ts) and
   // served from src/web/router.ts. The Workers Assets upload API returns 401
@@ -32,7 +33,16 @@
   },
 
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
   },
 
   "vars": {

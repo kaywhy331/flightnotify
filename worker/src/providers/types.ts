@@ -183,6 +183,8 @@ export interface FareProvider {
   readonly priceScope: PriceScopeValue;
   readonly exactEndpoint: EndpointTypeValue;
   readonly flexibleEndpoint: EndpointTypeValue;
+  /** Maximum HTTP attempts one logical search can consume. Defaults to one. */
+  readonly maxRequestCount?: number;
 
   /** True when credentials are present. Never returns the credential. */
   isConfigured(): boolean;

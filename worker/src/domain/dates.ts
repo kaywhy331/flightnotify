@@ -11,7 +11,10 @@
  * with actionable guidance rather than quietly truncated -- a silently
  * shortened sweep would under-report coverage forever.
  */
-export const MAX_CANDIDATES = 2000;
+// Keep one atomic D1 tracker/config/candidate batch comfortably below the
+// Free-plan 1,000-statement ceiling (the batch also contains tracker/version
+// metadata and market writes).
+export const MAX_CANDIDATES = 500;
 
 export interface DatePair {
   outbound: string;
@@ -27,11 +30,24 @@ export class DateWindowError extends Error {
 }
 
 const DAY_MS = 86_400_000;
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function toEpochDay(value: string): number {
+  if (!DATE_ONLY_RE.test(value)) throw new DateWindowError(`Not a valid date: ${value}`);
   const ms = Date.parse(`${value}T00:00:00Z`);
-  if (Number.isNaN(ms)) throw new DateWindowError(`Not a valid date: ${value}`);
+  if (Number.isNaN(ms) || new Date(ms).toISOString().slice(0, 10) !== value) {
+    throw new DateWindowError(`Not a valid date: ${value}`);
+  }
   return Math.round(ms / DAY_MS);
+}
+
+export function isValidDateOnly(value: string): boolean {
+  try {
+    toEpochDay(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function fromEpochDay(day: number): string {

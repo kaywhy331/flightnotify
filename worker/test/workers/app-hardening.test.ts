@@ -60,7 +60,9 @@ function configFor(overrides: Partial<Env> = {}) {
 }
 
 /** A provider whose search methods must not be reached unless told otherwise. */
-function stubProvider(result?: () => ProviderResult): FareProvider & { calls: number } {
+function stubProvider(
+  result?: () => ProviderResult | Promise<ProviderResult>,
+): FareProvider & { calls: number } {
   const provider = {
     calls: 0,
     name: "stub",
@@ -261,6 +263,7 @@ beforeEach(async () => {
     "tracker_markets",
     "trackers",
     "provider_calls",
+    "provider_quota_hours",
     // A cached stub payload would short-circuit the live path of a later test.
     "query_cache",
     "cron_runs",
@@ -354,6 +357,209 @@ describe("mid-sweep resume pacing", () => {
     expect(runs?.n).toBe(2);
     expect(observations?.n).toBe(2);
     expect((await getTracker(id)).latest_price_cents).toBe(180000);
+  });
+});
+
+// ---------------------------------------------------- search invariants
+describe("search correctness invariants", () => {
+  it("does not label an unfinished provider attempt as successful", async () => {
+    const id = await insertTracker();
+    let release!: (result: ProviderResult) => void;
+    const pending = new Promise<ProviderResult>((resolve) => {
+      release = resolve;
+    });
+    const provider = stubProvider(() => pending);
+
+    const check = searchServiceWith(provider).runTracker(
+      await getTracker(id),
+      RunTrigger.MANUAL,
+    );
+    await expect.poll(() => provider.calls).toBe(1);
+
+    const open = (await repo().recentRuns(id, 1))[0];
+    expect(open?.status).toBe("running");
+    expect(open?.completed_at).toBeNull();
+
+    release(offerResult(180000));
+    await check;
+    const complete = (await repo().recentRuns(id, 1))[0];
+    expect(complete?.status).toBe("success");
+    expect(complete?.completed_at).not.toBeNull();
+  });
+
+  it("replays a versioned normalized cache result without calling the provider", async () => {
+    const id = await insertTracker();
+    const live = stubProvider(() => offerResult(180000));
+    await searchServiceWith(live).runTracker(await getTracker(id), RunTrigger.MANUAL);
+    expect(live.calls).toBe(1);
+
+    const mustStayCached = stubProvider();
+    const replay = await searchServiceWith(mustStayCached).runTracker(
+      await getTracker(id),
+      RunTrigger.MANUAL,
+    );
+
+    expect(mustStayCached.calls).toBe(0);
+    expect(replay.cacheHits).toBe(1);
+    expect(replay.bestPriceCents).toBe(180000);
+    const run = (await repo().recentRuns(id, 1))[0];
+    expect(run?.cache_status).toBe("hit");
+    expect(run?.provider_request_count).toBe(0);
+  });
+
+  it("discards a legacy excerpt-only cache row and refetches in the same check", async () => {
+    const id = await insertTracker();
+    const first = stubProvider(() => offerResult(180000));
+    await searchServiceWith(first).runTracker(await getTracker(id), RunTrigger.MANUAL);
+    const prior = (await repo().recentRuns(id, 1))[0]!;
+    await env.DB.prepare("UPDATE query_cache SET payload = ? WHERE fingerprint = ?")
+      .bind(JSON.stringify({ search_metadata: { status: "Success" } }), prior.query_fingerprint)
+      .run();
+
+    const fresh = stubProvider(() => offerResult(170000));
+    const result = await searchServiceWith(fresh).runTracker(
+      await getTracker(id),
+      RunTrigger.MANUAL,
+    );
+    expect(fresh.calls).toBe(1);
+    expect(result.cacheHits).toBe(0);
+    expect(result.bestPriceCents).toBe(170000);
+  });
+
+  it("keeps a date pair pending until every market finishes and retains the cheapest", async () => {
+    const id = await insertTracker({
+      date_mode: "custom_window",
+      outbound_date: null,
+      return_date: null,
+      window_outbound_start: addDays(today(), 30),
+      window_outbound_end: addDays(today(), 30),
+      min_nights: 7,
+      max_nights: 7,
+      candidates_per_run: 1,
+    });
+    await repo().setTrackerMarkets(id, ["us", "ca"]);
+    const versionId = await seedWindow(id, 1);
+    const prices = [180000, 150000];
+    const provider = stubProvider(() => offerResult(prices.shift()!));
+
+    await searchServiceWith(provider).runTracker(await getTracker(id), RunTrigger.SCHEDULED, {
+      maxQueries: 1,
+    });
+    const pendingCandidate = (await repo().claimCandidates(versionId, 1, 10))[0];
+    expect(pendingCandidate?.status).toBe("pending");
+
+    await searchServiceWith(provider).runTracker(await getTracker(id), RunTrigger.SCHEDULED, {
+      maxQueries: 1,
+    });
+    const candidate = await env.DB.prepare(
+      "SELECT * FROM flexible_date_candidates WHERE config_version_id = ?",
+    )
+      .bind(versionId)
+      .first();
+    expect(candidate?.status).toBe("checked");
+    expect(candidate?.last_price_cents).toBe(150000);
+    expect(provider.calls).toBe(2);
+  });
+
+  it("increments consecutive failures once for a failed multi-market check", async () => {
+    const id = await insertTracker();
+    await repo().setTrackerMarkets(id, ["us", "ca"]);
+    const failing = stubProvider(() => {
+      throw new ProviderError("upstream refused", "SerpApi returned an error.");
+    });
+
+    await searchServiceWith(failing).runTracker(await getTracker(id), RunTrigger.SCHEDULED);
+    expect(failing.calls).toBe(2);
+    expect((await getTracker(id)).consecutive_failures).toBe(1);
+  });
+
+  it("stores provider-filter violations as ineligible and never selects them", async () => {
+    const id = await insertTracker({ stops: "nonstop" });
+    const result = offerResult(120000);
+    result.offers[0]!.stops = 1;
+
+    const check = await searchServiceWith(stubProvider(() => result)).runTracker(
+      await getTracker(id),
+      RunTrigger.MANUAL,
+    );
+    expect(check.bestPriceCents).toBeNull();
+    const observation = await env.DB.prepare(
+      "SELECT eligible, exclusion_reason FROM fare_observations WHERE tracker_id = ?",
+    )
+      .bind(id)
+      .first<{ eligible: number; exclusion_reason: string | null }>();
+    expect(observation?.eligible).toBe(0);
+    expect(observation?.exclusion_reason).toMatch(/requires nonstop/);
+    expect((await getTracker(id)).latest_price_cents).toBeNull();
+  });
+
+  it("retains the first eligible fare when cheaper ineligible offers fill the storage cap", async () => {
+    const id = await insertTracker();
+    const result = offerResult(26000);
+    const eligible = result.offers[0]!;
+    result.offers = Array.from({ length: 25 }, (_, index) => ({
+      ...eligible,
+      priceCents: 10000 + index,
+      currency: "EUR",
+      flightNumbers: [`XX ${index + 1}`],
+    }));
+    result.offers.push(eligible);
+
+    const check = await searchServiceWith(stubProvider(() => result)).runTracker(
+      await getTracker(id),
+      RunTrigger.MANUAL,
+    );
+
+    expect(check.bestPriceCents).toBe(26000);
+    expect((await getTracker(id)).latest_price_cents).toBe(26000);
+    const stored = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM fare_observations WHERE tracker_id = ?",
+    )
+      .bind(id)
+      .first<{ n: number }>();
+    expect(stored?.n).toBe(25);
+  });
+
+  it("compares prior per-traveler observations on the tracker's party basis", async () => {
+    const id = await insertTracker({
+      threshold_amount_cents: 5000,
+      threshold_basis: "party",
+      alert_on_threshold: 0,
+      alert_on_new_low: 1,
+      min_drop_absolute_cents: 1500,
+    });
+    const prices = [10000, 9000];
+    const provider = stubProvider(() => offerResult(prices.shift()!));
+    const overrides = {
+      SERPAPI_PRICE_SCOPE: "per_traveler",
+      QUERY_CACHE_TTL_SECONDS: "0",
+    } satisfies Partial<Env>;
+
+    await searchServiceWith(provider, { overrides }).runTracker(
+      await getTracker(id),
+      RunTrigger.MANUAL,
+    );
+    await searchServiceWith(provider, { overrides }).runTracker(
+      await getTracker(id),
+      RunTrigger.MANUAL,
+    );
+
+    const alerts = await repo().recentAlerts(5);
+    expect(alerts.map((alert) => alert.alert_type)).toContain("new_low");
+    expect(alerts[0]?.message_text).toContain("down $20");
+  });
+
+  it("atomically grants only one final monthly quota slot", async () => {
+    const config = configFor({
+      MONTHLY_SEARCH_BUDGET: "1",
+      SEARCH_BUDGET_RESERVE_PERCENT: "0",
+    });
+    const quota = new QuotaManager(repo(), config);
+    const attempts = await Promise.all([
+      quota.reserveCalls(1, RunTrigger.MANUAL),
+      quota.reserveCalls(1, RunTrigger.MANUAL),
+    ]);
+    expect(attempts.filter((item) => item.reservation !== null)).toHaveLength(1);
   });
 });
 
@@ -468,7 +674,20 @@ describe("static asset versioning", () => {
       testEnv(),
     );
     expect(response.status).toBe(200);
-    expect(response.headers.get("Cache-Control")).toBe("public, max-age=86400");
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=31536000, immutable",
+    );
+  });
+
+  it("accepts weak and comma-separated ETag validators", async () => {
+    const response = await handleRequest(
+      new Request(`${BASE}/static/app.css?v=${APP_CSS_ETAG}`, {
+        headers: { "If-None-Match": `"other", W/"${APP_CSS_ETAG}"` },
+      }),
+      testEnv(),
+    );
+    expect(response.status).toBe(304);
+    expect(response.headers.get("Cache-Control")).toContain("immutable");
   });
 });
 
@@ -577,6 +796,41 @@ describe("itinerary detail in the price history", () => {
     const html = await getHtml(`/trackers/${id}`, await signIn());
     expect(html).toContain("Price history");
     expect(html).not.toContain("<summary>Details</summary>");
+  });
+});
+
+describe("price-history pagination", () => {
+  it("clamps an out-of-range page to the last page with data", async () => {
+    const id = await insertTracker({ latest_price_cents: 100000 });
+    const runId = await repo().insertSearchRun({
+      tracker_id: id,
+      batch_id: "pagination",
+      trigger: "manual",
+      endpoint: "google_flights",
+      market: "us",
+      currency: "USD",
+      query_fingerprint: "pagination",
+      started_at: toIso(new Date()),
+    });
+    await repo().insertObservations(
+      Array.from({ length: 51 }, (_, index) => ({
+        search_run_id: runId,
+        tracker_id: id,
+        itinerary_fingerprint: `page-${index}`,
+        price_amount_cents: 100000 + index,
+        currency: "USD",
+        price_scope: "party_total",
+        market: "us",
+        observed_at: toIso(new Date(Date.now() - index * 60_000)),
+        eligible: 1,
+        is_best_of_run: 0,
+      })),
+    );
+
+    const html = await getHtml(`/trackers/${id}?page=999`, await signIn());
+    expect(html).toContain("Page 2 of 2 · 51 observations");
+    expect(html).not.toContain("Page 999");
+    expect(html.match(/data-label="Observed"/g)).toHaveLength(1);
   });
 });
 

@@ -22,18 +22,24 @@ import {
   FlexDuration,
   StopsPreference,
   ThresholdBasis,
-  TrackerStatus,
   type DateModeValue,
 } from "../domain/enums.js";
 import {
   DateWindowError,
   flexiblePresetMonth,
   generatePairs,
+  isValidDateOnly,
   orderedPairs,
   type DatePair,
 } from "../domain/dates.js";
 import { centsFromDecimalString } from "../domain/money.js";
-import { assess, estimate, type BudgetVerdict, type PlanEstimate } from "../services/planner.js";
+import {
+  SCHEDULE_CHOICES,
+  assess,
+  estimate,
+  type BudgetVerdict,
+  type PlanEstimate,
+} from "../services/planner.js";
 import type { QuotaSnapshot } from "../services/quota.js";
 import { nowIso } from "../time.js";
 
@@ -86,9 +92,13 @@ const VALUE_KEYS = [
   "min_drop_percent",
 ] as const;
 
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const IATA_RE = /^[A-Z]{3}$/;
 const MARKET_RE = /^[a-z]{2}$/;
+export const AVAILABLE_MARKETS = ["us", "gb", "ca", "au", "de", "jp"] as const;
+const AIRLINES_RE = /^[A-Z0-9]{2}(,[A-Z0-9]{2})*$/;
+const MAX_MARKETS = 4;
+const MAX_CANDIDATES_PER_RUN = 10;
+const ALLOWED_INTERVALS = new Set(SCHEDULE_CHOICES.map(([minutes]) => minutes));
 
 function intOr(value: string, fallback: number): number {
   const parsed = Number(value);
@@ -105,7 +115,10 @@ export function parseTrackerForm(
   form: FormData,
   options: { defaultMarket: string; today: string },
 ): ParsedTrackerForm {
-  const get = (key: string): string => String(form.get(key) ?? "").trim();
+  const get = (key: string): string => {
+    const value = form.get(key);
+    return typeof value === "string" ? value.trim() : "";
+  };
   const values: Record<string, string> = {};
   for (const key of VALUE_KEYS) values[key] = get(key);
   values["alert_on_threshold"] = form.get("alert_on_threshold") ? "on" : "";
@@ -117,13 +130,22 @@ export function parseTrackerForm(
   // --- markets ----------------------------------------------------------
   const rawMarkets = form
     .getAll("markets")
-    .map((m) => String(m).trim().toLowerCase())
+    .map((market) => (typeof market === "string" ? market.trim().toLowerCase() : ""))
     .filter((m) => m !== "");
-  const markets = [...new Set(rawMarkets)].filter((m) => MARKET_RE.test(m));
-  if (rawMarkets.length > 0 && markets.length === 0) {
-    errors["markets"] = "Use two-letter country codes such as us or gb.";
+  const markets = [...new Set(rawMarkets)];
+  const supportedMarkets = new Set<string>([...AVAILABLE_MARKETS, options.defaultMarket]);
+  if (
+    markets.some((market) => !MARKET_RE.test(market) || !supportedMarkets.has(market))
+  ) {
+    errors["markets"] = "Choose only one of the offered country markets.";
+  } else if (markets.length > MAX_MARKETS) {
+    errors["markets"] = `Select at most ${MAX_MARKETS} country markets; each costs a provider search.`;
   }
-  const effectiveMarkets = markets.length > 0 ? markets : [options.defaultMarket];
+  const effectiveMarkets =
+    markets.length > 0 &&
+    markets.every((market) => MARKET_RE.test(market) && supportedMarkets.has(market))
+      ? markets
+      : [options.defaultMarket];
   values["markets"] = effectiveMarkets.join(",");
 
   // --- identity and route ------------------------------------------------
@@ -151,6 +173,32 @@ export function parseTrackerForm(
   if (infantsOnLap > adults) {
     // One lap infant needs one adult lap.
     errors["infants_on_lap"] = "There must be at least one adult per lap infant.";
+  }
+  const passengerTotal = adults + children + infantsInSeat + infantsOnLap;
+  if (passengerTotal > 9) {
+    errors["adults"] = `Google Flights allows at most 9 passengers; this tracker has ${passengerTotal}.`;
+  }
+
+  const cabin = values["cabin"] || Cabin.ECONOMY;
+  if (!Object.values(Cabin).includes(cabin as (typeof Cabin)[keyof typeof Cabin])) {
+    errors["cabin"] = "Choose a supported cabin.";
+  }
+  const stops = values["stops"] || StopsPreference.ANY;
+  if (!Object.values(StopsPreference).includes(stops as (typeof StopsPreference)[keyof typeof StopsPreference])) {
+    errors["stops"] = "Choose a supported stops preference.";
+  }
+  const includeAirlines = values["include_airlines"]!.toUpperCase().replace(/\s+/g, "");
+  const excludeAirlines = values["exclude_airlines"]!.toUpperCase().replace(/\s+/g, "");
+  values["include_airlines"] = includeAirlines;
+  values["exclude_airlines"] = excludeAirlines;
+  if (includeAirlines && !AIRLINES_RE.test(includeAirlines)) {
+    errors["include_airlines"] = "Use comma-separated 2-character airline codes, for example UA,NH.";
+  }
+  if (excludeAirlines && !AIRLINES_RE.test(excludeAirlines)) {
+    errors["exclude_airlines"] = "Use comma-separated 2-character airline codes, for example UA,NH.";
+  }
+  if (includeAirlines && excludeAirlines) {
+    errors["exclude_airlines"] = "Choose included airlines or excluded airlines, not both.";
   }
 
   // --- comparison --------------------------------------------------------
@@ -189,12 +237,16 @@ export function parseTrackerForm(
 
   // --- scheduling --------------------------------------------------------
   const checkIntervalMinutes = intOr(values["check_interval_minutes"] || "720", -1);
-  if (checkIntervalMinutes < 15) {
-    errors["check_interval_minutes"] = "The minimum interval is 15 minutes.";
+  if (!ALLOWED_INTERVALS.has(checkIntervalMinutes)) {
+    errors["check_interval_minutes"] = "Choose one of the offered check frequencies.";
   }
   const cooldownMinutes = intOr(values["cooldown_minutes"] || "360", -1);
   if (cooldownMinutes < 0) errors["cooldown_minutes"] = "Cannot be negative.";
-  const candidatesPerRun = Math.max(1, intOr(values["candidates_per_run"] || "1", 1));
+  const candidatesPerRun = intOr(values["candidates_per_run"] || "1", -1);
+  if (candidatesPerRun < 1 || candidatesPerRun > MAX_CANDIDATES_PER_RUN) {
+    errors["candidates_per_run"] =
+      `Check between 1 and ${MAX_CANDIDATES_PER_RUN} date combinations per run.`;
+  }
 
   // --- dates -------------------------------------------------------------
   const dateMode = (values["date_mode"] || DateMode.EXACT) as DateModeValue;
@@ -226,8 +278,8 @@ export function parseTrackerForm(
   if (dateMode === DateMode.EXACT) {
     const outbound = values["outbound_date"]!;
     const ret = values["return_date"]!;
-    if (!DATE_RE.test(outbound)) errors["outbound_date"] = "Choose an outbound date.";
-    if (!DATE_RE.test(ret)) errors["return_date"] = "Choose a return date.";
+    if (!isValidDateOnly(outbound)) errors["outbound_date"] = "Choose a valid outbound date.";
+    if (!isValidDateOnly(ret)) errors["return_date"] = "Choose a valid return date.";
     if (!errors["outbound_date"] && !errors["return_date"]) {
       if (ret < outbound) {
         errors["return_date"] = "The return date must not be before the outbound date.";
@@ -274,12 +326,12 @@ export function parseTrackerForm(
     const minNights = hasMinNights ? intOr(minRaw, -1) : null;
     const maxNights = hasMaxNights ? intOr(maxRaw, -1) : null;
 
-    if (!DATE_RE.test(start)) errors["window_outbound_start"] = "Choose the earliest departure.";
-    if (!DATE_RE.test(end)) errors["window_outbound_end"] = "Choose the latest departure.";
-    if (hasReturnStart && !DATE_RE.test(returnStart)) {
+    if (!isValidDateOnly(start)) errors["window_outbound_start"] = "Choose a valid earliest departure.";
+    if (!isValidDateOnly(end)) errors["window_outbound_end"] = "Choose a valid latest departure.";
+    if (hasReturnStart && !isValidDateOnly(returnStart)) {
       errors["window_return_start"] = "Choose a valid earliest return date.";
     }
-    if (hasReturnEnd && !DATE_RE.test(returnEnd)) {
+    if (hasReturnEnd && !isValidDateOnly(returnEnd)) {
       errors["window_return_end"] = "Choose a valid latest return date.";
     }
     if (hasReturnStart !== hasReturnEnd) {
@@ -356,6 +408,17 @@ export function parseTrackerForm(
   }
 
   const sampledModeAck = values["sampled_mode_ack"] === "on";
+  const thresholdBasis = values["threshold_basis"] || ThresholdBasis.PARTY;
+  if (
+    !Object.values(ThresholdBasis).includes(
+      thresholdBasis as (typeof ThresholdBasis)[keyof typeof ThresholdBasis],
+    )
+  ) {
+    errors["threshold_basis"] = "Choose whether the threshold is for the party or each traveler.";
+  }
+  if (!values["alert_on_threshold"] && !values["alert_on_new_low"]) {
+    errors["alert_on_threshold"] = "Turn on at least one alert type so this tracker can notify you.";
+  }
 
   const fields: Record<string, unknown> =
     Object.keys(errors).length > 0
@@ -368,15 +431,15 @@ export function parseTrackerForm(
           children,
           infants_in_seat: infantsInSeat,
           infants_on_lap: infantsOnLap,
-          cabin: values["cabin"] || Cabin.ECONOMY,
-          stops: values["stops"] || StopsPreference.ANY,
-          include_airlines: values["include_airlines"] || null,
-          exclude_airlines: values["exclude_airlines"] || null,
+          cabin,
+          stops,
+          include_airlines: includeAirlines || null,
+          exclude_airlines: excludeAirlines || null,
           currency,
           date_mode: dateMode,
           ...dateFields,
           threshold_amount_cents: thresholdCents,
-          threshold_basis: values["threshold_basis"] || ThresholdBasis.PARTY,
+          threshold_basis: thresholdBasis,
           alert_on_threshold: values["alert_on_threshold"] ? 1 : 0,
           alert_on_new_low: values["alert_on_new_low"] ? 1 : 0,
           min_drop_absolute_cents: minDropAbsolute,
@@ -385,7 +448,6 @@ export function parseTrackerForm(
           check_interval_minutes: checkIntervalMinutes,
           candidates_per_run: candidatesPerRun,
           sampled_mode_ack: sampledModeAck ? 1 : 0,
-          status: TrackerStatus.ACTIVE,
           updated_at: nowIso(),
         };
 
@@ -406,11 +468,16 @@ export interface FormBudget {
   estimate: PlanEstimate;
   verdict: BudgetVerdict;
   candidateCount: number;
+  candidatesPerScan: number;
   marketCount: number;
 }
 
 /** Budget preview for a parsed form, against the live quota snapshot. */
-export function budgetFor(parsed: ParsedTrackerForm, snapshot: QuotaSnapshot): FormBudget {
+export function budgetFor(
+  parsed: ParsedTrackerForm,
+  snapshot: QuotaSnapshot,
+  maxRequestsPerSearch = 1,
+): FormBudget {
   const plan = {
     dateMode: parsed.dateMode,
     marketCount: parsed.markets.length,
@@ -418,7 +485,7 @@ export function budgetFor(parsed: ParsedTrackerForm, snapshot: QuotaSnapshot): F
     candidatesPerRun: parsed.candidatesPerRun,
     totalCandidates: parsed.candidates.length,
   };
-  const est = estimate(plan);
+  const est = estimate(plan, undefined, maxRequestsPerSearch);
   return {
     estimate: est,
     verdict: assess({
@@ -429,6 +496,8 @@ export function budgetFor(parsed: ParsedTrackerForm, snapshot: QuotaSnapshot): F
       plan,
     }),
     candidateCount: parsed.candidates.length,
+    candidatesPerScan:
+      parsed.dateMode === DateMode.CUSTOM_WINDOW ? Math.max(1, parsed.candidatesPerRun) : 1,
     marketCount: parsed.markets.length,
   };
 }
@@ -437,7 +506,10 @@ export function budgetFor(parsed: ParsedTrackerForm, snapshot: QuotaSnapshot): F
 export function valuesFromTracker(tracker: Record<string, unknown>): Record<string, string> {
   const out: Record<string, string> = {};
   const put = (key: string, value: unknown): void => {
-    if (value !== null && value !== undefined && value !== "") out[key] = String(value);
+    if (
+      value !== "" &&
+      (typeof value === "string" || typeof value === "number" || typeof value === "boolean")
+    ) out[key] = String(value);
   };
 
   for (const key of [

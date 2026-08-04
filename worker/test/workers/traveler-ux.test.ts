@@ -200,6 +200,7 @@ beforeEach(async () => {
     "tracker_markets",
     "trackers",
     "provider_calls",
+    "provider_quota_hours",
     "query_cache",
     "auth_throttle",
     "app_settings",
@@ -299,6 +300,7 @@ describe("trip completion", () => {
     form.set("return_date", addDays(today(), 98));
     form.set("threshold_amount", "1300");
     form.set("check_interval_minutes", "720");
+    form.set("alert_on_threshold", "on");
     form.append("markets", "us");
 
     const response = await handleRequest(
@@ -327,6 +329,13 @@ describe("trip completion", () => {
 
     const coverage = await r.candidateCoverage(versionId, 1);
     expect(coverage).toEqual({ checked: 1, total: 2 });
+
+    await r.startNextCycle(versionId, 2, today());
+    const afterRollover = await env.DB.prepare(
+      "SELECT outbound_date, cycle, status FROM flexible_date_candidates ORDER BY outbound_date",
+    ).all<{ outbound_date: string; cycle: number; status: string }>();
+    expect(afterRollover.results[0]).toMatchObject({ cycle: 1, status: "checked" });
+    expect(afterRollover.results[1]).toMatchObject({ cycle: 2, status: "pending" });
   });
 });
 
@@ -676,6 +685,8 @@ describe("traveler-facing UI", () => {
     form.set("min_drop_absolute", "50");
     form.set("min_drop_percent", "5");
     form.set("check_interval_minutes", "720");
+    form.set("alert_on_threshold", "on");
+    form.set("alert_on_new_low", "on");
     form.append("markets", "us");
 
     const response = await handleRequest(
@@ -687,7 +698,7 @@ describe("traveler-facing UI", () => {
     const [tracker] = await repo().listTrackers();
     expect(tracker).toMatchObject({
       threshold_basis: "per_traveler",
-      include_airlines: "NH, UA",
+      include_airlines: "NH,UA",
       infants_in_seat: 1,
       infants_on_lap: 1,
       min_drop_absolute_cents: 5000,
@@ -696,7 +707,7 @@ describe("traveler-facing UI", () => {
 
     // And the edit form comes back populated with them.
     const editHtml = await getHtml(`/trackers/${tracker!.id}/edit`, cookie);
-    expect(editHtml).toMatch(/name="include_airlines"[^>]*value="NH, UA"/);
+    expect(editHtml).toMatch(/name="include_airlines"[^>]*value="NH,UA"/);
     expect(editHtml).toMatch(/name="min_drop_percent"[^>]*value="5"/);
     expect(editHtml).toMatch(/value="per_traveler"[^>]*selected/);
   });

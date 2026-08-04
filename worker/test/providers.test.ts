@@ -446,6 +446,21 @@ describe("error classification", () => {
     });
   });
 
+  it("refuses an oversized provider payload without retrying it", async () => {
+    const calls: URL[] = [];
+    const call = provider(
+      [{ body: {}, headers: { "Content-Length": String(8 * 1024 * 1024 + 1) } }],
+      calls,
+    ).searchExact(exactQuery());
+
+    await expect(call).rejects.toBeInstanceOf(ProviderMalformedResponseError);
+    await call.catch((error: ProviderMalformedResponseError) => {
+      expect(error.message).toContain("8 MiB safety limit");
+      expect(error.requestCount).toBe(1);
+    });
+    expect(calls).toHaveLength(1);
+  });
+
   it("classifies a bare HTTP failure with no message as a provider error", async () => {
     const call = provider([{ body: {}, status: 400 }]).searchExact(exactQuery());
     await expect(call).rejects.toBeInstanceOf(ProviderError);
@@ -462,6 +477,7 @@ describe("error classification", () => {
     ).searchExact(exactQuery());
     expect(calls).toHaveLength(2);
     expect(result.offers).toHaveLength(2);
+    expect(result.requestCount).toBe(2);
   });
 
   it("gives up after the attempt limit and reports a network error", async () => {
@@ -476,6 +492,7 @@ describe("error classification", () => {
     await expect(call).rejects.toBeInstanceOf(ProviderNetworkError);
     await call.catch((error: ProviderNetworkError) => {
       expect(error.category).toBe(ErrorCategory.NETWORK);
+      expect(error.requestCount).toBe(3);
     });
     expect(calls).toHaveLength(3);
   });
